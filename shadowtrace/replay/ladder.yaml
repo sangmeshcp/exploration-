@@ -1,0 +1,33 @@
+# Candidate ladder (plan.md M3.2). Local candidates (Ollama/vLLM, D3) are
+# listed first and cost $0 — sampler/runner exhaust these before spending
+# replay budget on metered cloud candidates.
+candidates:
+  - name: ollama-llama3.1-8b
+    provider: ollama
+    local: true
+    price_per_mtok_in: 0.0
+    price_per_mtok_out: 0.0
+
+  - name: vllm-qwen2.5-14b
+    provider: vllm
+    local: true
+    price_per_mtok_in: 0.0
+    price_per_mtok_out: 0.0
+
+  - name: claude-haiku-4-5
+    provider: anthropic
+    local: false
+    price_per_mtok_in: 1.0
+    price_per_mtok_out: 5.0
+
+  - name: claude-sonnet-4-6
+    provider: anthropic
+    local: false
+    price_per_mtok_in: 3.0
+    price_per_mtok_out: 15.0
+
+  - name: openrouter-llama3.1-70b
+    provider: openrouter
+    local: false
+    price_per_mtok_in: 0.4
+    price_per_mtok_out: 0.4
