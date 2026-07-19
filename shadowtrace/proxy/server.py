@@ -16,10 +16,12 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
+from opentelemetry import trace
 
 from shadowtrace.common.config import Settings, get_settings
 from shadowtrace.common.logging import get_logger
 from shadowtrace.common.metrics import REGISTRY
+from shadowtrace.common.tracing import get_default_tracer
 from shadowtrace.common.ulid import new_ulid
 from shadowtrace.proxy.capture import CaptureWriter, TraceRecord
 from shadowtrace.proxy.passthrough import forward, tee_stream
@@ -136,6 +138,7 @@ class ProxyConfig:
     settings: Settings | None = None
     request_timeout_s: float = 60.0
     transport: httpx.AsyncBaseTransport | None = None  # test hook: route via ASGITransport
+    tracer: trace.Tracer | None = None
 
 
 def create_app(config: ProxyConfig | None = None) -> FastAPI:
@@ -147,6 +150,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         timeout=httpx.Timeout(config.request_timeout_s), transport=config.transport
     )
     capture = CaptureWriter(settings.sqlite_path, settings.spill_dir)
+    tracer = config.tracer or get_default_tracer()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -171,6 +175,25 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         return {"ready": ready}
 
     async def _proxy(request: Request, base_url: str, tool_hint: str) -> Response:
+        # Generated up front so it doubles as the OTel span's correlation
+        # id *and* the captured row's primary key — log/trace/data
+        # joinability per plan.md §4.5.
+        trace_id = new_ulid()
+
+        with tracer.start_as_current_span(
+            "proxy_request",
+            attributes={
+                "correlation_id": trace_id,
+                "method": request.method,
+                "path": request.url.path,
+                "tool": tool_hint,
+            },
+        ) as span:
+            return await _handle_proxy_request(request, base_url, tool_hint, trace_id, span)
+
+    async def _handle_proxy_request(
+        request: Request, base_url: str, tool_hint: str, trace_id: str, span: trace.Span
+    ) -> Response:
         REGISTRY.inc("requests_total", labels={"status": "started"})
         body = await request.body()
         target_url = base_url.rstrip("/") + request.url.path
@@ -184,13 +207,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         except httpx.HTTPError as exc:
             logger.exception("upstream request failed")
             REGISTRY.inc("requests_total", labels={"status": "upstream_error"})
+            span.set_status(trace.Status(trace.StatusCode.ERROR))
             return Response(content=str(exc), status_code=502)
         proxy_overhead_ms = (time.perf_counter() - start) * 1000
         REGISTRY.observe("proxy_added_latency_ms", proxy_overhead_ms)
+        span.set_attribute("proxy_added_latency_ms", proxy_overhead_ms)
+        span.set_attribute("upstream_status_code", upstream_resp.status_code)
 
         response_headers = _filtered_headers(upstream_resp.headers)
         content_type = upstream_resp.headers.get("content-type", "")
-        trace_id = new_ulid()
         received_ts = int(time.time() * 1000)
 
         def on_complete(raw_body: bytes, status_code: int) -> None:

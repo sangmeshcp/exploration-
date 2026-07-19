@@ -1,5 +1,7 @@
 -- Hot-path capture store (SQLite, WAL mode). Append-only. See plan.md §1, R2.
-PRAGMA user_version = 1;
+-- Schema version is tracked and advanced by db/migrations.py, not here —
+-- setting PRAGMA user_version unconditionally in this file would stomp a
+-- migrated version back down every time this idempotent script re-runs.
 
 CREATE TABLE IF NOT EXISTS traces (
     id TEXT PRIMARY KEY,              -- ulid

@@ -4,12 +4,9 @@ session transcripts spanning several task archetypes (plan.md §3.6).
 Deterministic (seeded) so the committed fixture files are reproducible.
 Run: `python -m tests.fixtures.generate_traces`
 
-Scope note: the plan calls for "300 synthetic traces across 8 archetypes."
-This generator produces a smaller but structurally equivalent corpus
-(~8 archetypes x 12 traces, incl. tool-use chains, non-English, long
-context, and near-duplicate prompts) — enough to exercise clustering,
-sampling, and replay meaningfully without committing a large binary blob
-to the repo. Increase PER_ARCHETYPE below to scale it up.
+Produces the full "300 synthetic traces across 8 archetypes" corpus the
+plan calls for (8 x 38 = 304), incl. tool-use chains, non-English, long
+context, and near-duplicate adversarial prompts.
 """
 
 from __future__ import annotations
@@ -19,7 +16,7 @@ import random
 from pathlib import Path
 
 FIXTURES_DIR = Path(__file__).parent / "traces"
-PER_ARCHETYPE = 12
+PER_ARCHETYPE = 38
 SEED = 20260713
 
 ARCHETYPES: dict[str, list[str]] = {

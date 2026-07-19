@@ -14,6 +14,7 @@ class SampleRow:
     ts: int
     request_json: str
     response_json: str  # the frontier response — free baseline for the judge
+    session_id: str | None = None
 
 
 def sample_traces(
@@ -34,7 +35,7 @@ def sample_traces(
     params: list[Any] = [archetype_id] if archetype_id else []
     rows = conn.execute(
         f"""
-        SELECT t.id, aa.archetype_id, t.ts, t.request_json, t.response_json
+        SELECT t.id, aa.archetype_id, t.ts, t.request_json, t.response_json, t.session_id
         FROM traces t
         JOIN archetype_assignments aa ON aa.trace_id = t.id
         JOIN archetypes a ON a.id = aa.archetype_id AND a.merged_into IS NULL
@@ -46,9 +47,9 @@ def sample_traces(
     ).fetchall()
 
     by_archetype: dict[str, list[SampleRow]] = {}
-    for trace_id, arch_id, ts, request_json, response_json in rows:
+    for trace_id, arch_id, ts, request_json, response_json, session_id in rows:
         by_archetype.setdefault(arch_id, []).append(
-            SampleRow(trace_id, arch_id, ts, request_json, response_json)
+            SampleRow(trace_id, arch_id, ts, request_json, response_json, session_id)
         )
 
     result: dict[str, list[SampleRow]] = {}
@@ -62,3 +63,68 @@ def sample_traces(
         result[arch_id] = recent + extra
 
     return result
+
+
+def top_archetypes_by_volume(conn: Any, n: int = 2) -> list[str]:
+    """The archetypes eligible for chain replay (plan.md M3.6, review R6:
+    restricted to the top-N by volume so chain-replay cost can't explode
+    across the whole archetype set)."""
+    rows = conn.execute(
+        "SELECT aa.archetype_id, count(*) AS n FROM archetype_assignments aa "
+        "JOIN archetypes a ON a.id = aa.archetype_id AND a.merged_into IS NULL "
+        "GROUP BY aa.archetype_id ORDER BY n DESC LIMIT ?",
+        [n],
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+@dataclass
+class ReplayChain:
+    archetype_id: str
+    session_id: str
+    steps: list[SampleRow]  # ordered oldest-first
+
+
+def sample_chains(
+    conn: Any,
+    archetype_ids: list[str],
+    max_chains_per_archetype: int = 3,
+    max_steps_per_chain: int = 5,
+    seed: int = 0,
+) -> list[ReplayChain]:
+    """Group traces into ordered multi-step sessions for chain-replay mode.
+    Only sessions with >= 2 steps qualify as a chain; single-step sessions
+    are left for the ordinary single-call replay path in `sample_traces`.
+    """
+    chains: list[ReplayChain] = []
+    for archetype_id in archetype_ids:
+        rows = conn.execute(
+            """
+            SELECT t.id, aa.archetype_id, t.ts, t.request_json, t.response_json, t.session_id
+            FROM traces t
+            JOIN archetype_assignments aa ON aa.trace_id = t.id
+            JOIN archetypes a ON a.id = aa.archetype_id AND a.merged_into IS NULL
+            WHERE t.quarantined = FALSE AND aa.archetype_id = ? AND t.session_id IS NOT NULL
+            ORDER BY t.session_id, t.ts ASC
+            """,
+            [archetype_id],
+        ).fetchall()
+
+        by_session: dict[str, list[SampleRow]] = {}
+        for trace_id, arch_id, ts, request_json, response_json, session_id in rows:
+            by_session.setdefault(session_id, []).append(
+                SampleRow(trace_id, arch_id, ts, request_json, response_json, session_id)
+            )
+
+        eligible = sorted(sid for sid, steps in by_session.items() if len(steps) >= 2)
+        rng = random.Random(f"{seed}:chains:{archetype_id}")
+        rng.shuffle(eligible)
+        for session_id in eligible[:max_chains_per_archetype]:
+            chains.append(
+                ReplayChain(
+                    archetype_id=archetype_id,
+                    session_id=session_id,
+                    steps=by_session[session_id][:max_steps_per_chain],
+                )
+            )
+    return chains

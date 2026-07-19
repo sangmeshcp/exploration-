@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from shadowtrace.common.metrics import REGISTRY
+from shadowtrace.db import sqlite as sqlite_db
 from shadowtrace.proxy.capture import CaptureWriter, TraceRecord
 
 
@@ -91,3 +92,54 @@ async def test_capture_redacts_before_persisting(tmp_path: Path) -> None:
     conn = sqlite3.connect(tmp_path / "cap.sqlite3")
     request_json = conn.execute("SELECT request_json FROM traces").fetchone()[0]
     assert "AKIAABCDEFGHIJKLMNOP" not in request_json
+
+
+@pytest.mark.asyncio
+async def test_capture_spills_when_sqlite_is_locked_by_another_writer(tmp_path: Path) -> None:
+    """E5: SQLite locked by a concurrent connection. The live session must
+    not hang indefinitely or crash — it spills within its (short, for this
+    test) busy_timeout and the fail-open metric fires."""
+    db_path = tmp_path / "cap.sqlite3"
+    sqlite_db.connect(db_path).close()  # create schema up front
+
+    blocker = sqlite3.connect(str(db_path), isolation_level=None)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        writer = CaptureWriter(
+            db_path, tmp_path / "spill", flush_interval=100.0, busy_timeout_ms=200
+        )
+        writer.enqueue(_record())
+        await writer.flush()
+    finally:
+        blocker.execute("COMMIT")
+        blocker.close()
+
+    spill_files = list((tmp_path / "spill").glob("spill-*.jsonl"))
+    assert len(spill_files) == 1
+    assert REGISTRY.get_counter("fail_open_events_total", {"component": "capture"}) == 1
+
+    # once the lock clears, the live session resumes normally
+    writer2 = CaptureWriter(db_path, tmp_path / "spill", flush_interval=100.0)
+    writer2.enqueue(_record(id_="01BBBB"))
+    await writer2.flush()
+    conn = sqlite3.connect(db_path)
+    assert conn.execute("SELECT count(*) FROM traces").fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_capture_drops_batch_without_crashing_when_sqlite_and_spill_both_fail(
+    tmp_path: Path,
+) -> None:
+    """E5: disk-full-on-spill-dir, compounded with SQLite also unavailable.
+    Total loss of the batch is acceptable; a crash propagating out of
+    flush() is not."""
+    bad_db_dir = tmp_path / "not_a_dir"
+    bad_db_dir.write_text("i am a file, not a directory")
+    bad_spill_dir = tmp_path / "not_a_spill_dir_either"
+    bad_spill_dir.write_text("also a file")
+
+    writer = CaptureWriter(bad_db_dir / "cap.sqlite3", bad_spill_dir, flush_interval=100.0)
+    writer.enqueue(_record())
+    await writer.flush()  # must not raise
+
+    assert REGISTRY.get_counter("spill_failed_total") == 1

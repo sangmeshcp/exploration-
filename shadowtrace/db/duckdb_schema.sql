@@ -1,4 +1,9 @@
 -- Analytics store (DuckDB). Populated by ETL from the SQLite hot path. See plan.md §1.
+-- Schema version tracked in schema_meta, advanced by db/migrations.py.
+
+CREATE TABLE IF NOT EXISTS schema_meta (
+    version INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS traces (
     id VARCHAR PRIMARY KEY,

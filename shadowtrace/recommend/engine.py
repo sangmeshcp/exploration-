@@ -16,6 +16,7 @@ from typing import Any
 
 from shadowtrace.common.metrics import REGISTRY
 from shadowtrace.common.ulid import new_ulid
+from shadowtrace.recommend import apply
 
 EXPIRY_DAYS = 45
 REGRESSION_SPOT_CHECK_WINDOW = 20
@@ -192,3 +193,27 @@ def check_regression(
     if breached:
         REGISTRY.inc("regression_alerts_total")
     return breached
+
+
+def watch_and_revert(
+    conn: Any,
+    writers: dict[str, apply.Writer],
+    applied_policy_id: str,
+    archetype_id: str,
+    candidate: str,
+    floor: float,
+    window: int = REGRESSION_SPOT_CHECK_WINDOW,
+) -> bool:
+    """The M4.4 regression-watch loop, wired end to end: if the spot-check
+    window has fallen below the floor this candidate was approved against,
+    one-click revert the applied policy and return True. A no-op (returns
+    False, nothing touched) if there isn't a full window of spot-check
+    data yet or the pass rate is still healthy — `applied_policies` and
+    the live router config are left exactly as they were.
+    """
+    if not check_regression(conn, archetype_id, candidate, floor, window):
+        return False
+    apply.revert_policy(
+        conn, writers, applied_policy_id, reason=f"regression: pass rate below floor {floor:.2f}"
+    )
+    return True

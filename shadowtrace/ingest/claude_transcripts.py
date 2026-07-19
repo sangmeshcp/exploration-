@@ -25,9 +25,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
+
 from shadowtrace.common.logging import get_logger
 from shadowtrace.common.metrics import REGISTRY
 from shadowtrace.common.timeparse import parse_ts_ms
+from shadowtrace.common.tracing import get_default_tracer
 from shadowtrace.common.ulid import new_ulid
 from shadowtrace.proxy.capture import CaptureWriter, TraceRecord
 
@@ -136,9 +140,12 @@ class TranscriptWatcher:
     daemon.
     """
 
-    def __init__(self, projects_dir: Path, capture: CaptureWriter) -> None:
+    def __init__(
+        self, projects_dir: Path, capture: CaptureWriter, tracer: trace.Tracer | None = None
+    ) -> None:
         self.projects_dir = projects_dir
         self.capture = capture
+        self.tracer = tracer or get_default_tracer()
         self._files: dict[Path, TranscriptFile] = {}
 
     def scan_once(self) -> int:
@@ -153,14 +160,19 @@ class TranscriptWatcher:
         ingested = 0
         for path in sorted(self.projects_dir.rglob("*.jsonl")):
             tf = self._files.setdefault(path, TranscriptFile(path))
-            try:
-                records = tf.poll()
-            except Exception:
-                logger.exception("failed to poll transcript file %s", path)
-                continue
-            for record in records:
-                self.capture.enqueue(record)
-                ingested += 1
+            with self.tracer.start_as_current_span(
+                "ingest_transcript_file", attributes={"path": str(path)}
+            ) as span:
+                try:
+                    records = tf.poll()
+                except Exception:
+                    logger.exception("failed to poll transcript file %s", path)
+                    span.set_status(Status(StatusCode.ERROR))
+                    continue
+                span.set_attribute("records_ingested", len(records))
+                for record in records:
+                    self.capture.enqueue(record)
+                    ingested += 1
 
         REGISTRY.set_gauge("transcripts_watched", len(self._files))
         newest_ts = max(

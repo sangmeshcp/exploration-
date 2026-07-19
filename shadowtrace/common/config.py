@@ -46,6 +46,11 @@ class Settings:
         return self.home / "logs"
 
     @property
+    def traces_path(self) -> Path:
+        """Local-file OTel span export target (plan.md §4.5)."""
+        return self.logs_dir / "traces.jsonl"
+
+    @property
     def checkpoints_dir(self) -> Path:
         return self.home / "checkpoints"
 

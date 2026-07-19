@@ -53,11 +53,13 @@ class CaptureWriter:
         spill_dir: Path,
         batch_size: int = 20,
         flush_interval: float = 1.0,
+        busy_timeout_ms: int = 5000,
     ) -> None:
         self.db_path = db_path
         self.spill_dir = spill_dir
         self.batch_size = batch_size
         self.flush_interval = flush_interval
+        self.busy_timeout_ms = busy_timeout_ms
         self._pending: list[TraceRecord] = []
         self._task: asyncio.Task[None] | None = None
         self._closed = False
@@ -101,7 +103,7 @@ class CaptureWriter:
             self._spill(batch)
 
     def _write_batch(self, batch: list[TraceRecord]) -> None:
-        conn = sqlite_db.connect(self.db_path)
+        conn = sqlite_db.connect(self.db_path, busy_timeout_ms=self.busy_timeout_ms)
         try:
             with conn:
                 for r in batch:
@@ -135,13 +137,24 @@ class CaptureWriter:
             conn.close()
 
     def _spill(self, batch: list[TraceRecord]) -> None:
-        self.spill_dir.mkdir(parents=True, exist_ok=True)
-        path = self.spill_dir / f"spill-{new_ulid()}.jsonl"
-        with path.open("w") as f:
-            for r in batch:
-                f.write(json.dumps(asdict(r), default=str) + "\n")
-        REGISTRY.inc("spill_rows_total", value=len(batch))
-        logger.warning("spilled %d rows to %s", len(batch), path)
+        """Last-resort persistence. If even this fails (e.g. disk full),
+        the batch is dropped with a loud log rather than propagating —
+        losing a batch of traces is acceptable; crashing the process (and
+        with it `stop()`'s shutdown path, or the flush loop) is not.
+        """
+        try:
+            self.spill_dir.mkdir(parents=True, exist_ok=True)
+            path = self.spill_dir / f"spill-{new_ulid()}.jsonl"
+            with path.open("w") as f:
+                for r in batch:
+                    f.write(json.dumps(asdict(r), default=str) + "\n")
+            REGISTRY.inc("spill_rows_total", value=len(batch))
+            logger.warning("spilled %d rows to %s", len(batch), path)
+        except Exception:
+            REGISTRY.inc("spill_failed_total", value=len(batch))
+            logger.exception(
+                "spill also failed; dropping %d rows to preserve fail-open", len(batch)
+            )
 
     async def _flush_loop(self) -> None:
         while not self._closed:

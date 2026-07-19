@@ -24,6 +24,7 @@ import uvicorn
 from shadowtrace.common.config import get_settings
 from shadowtrace.common.logging import get_logger
 from shadowtrace.common.metrics import REGISTRY
+from shadowtrace.common.tracing import build_tracer_provider
 from shadowtrace.db import duckdb_store
 from shadowtrace.db import sqlite as sqlite_db
 from shadowtrace.ingest.claude_transcripts import TranscriptWatcher
@@ -38,8 +39,20 @@ from shadowtrace.recommend.apply.litellm import LiteLLMWriter
 from shadowtrace.recommend.apply.nanoclaw import NanoClawWriter
 from shadowtrace.replay.graders.judge import judge as judge_answer
 from shadowtrace.replay.ladder import Candidate, load_ladder, sorted_by_cost
-from shadowtrace.replay.runner import CallResult, RateLimitError, ReplayRunner, RunnerConfig
-from shadowtrace.replay.sampler import SampleRow, sample_traces
+from shadowtrace.replay.runner import (
+    CallResult,
+    ChainReplayResult,
+    RateLimitError,
+    ReplayRunner,
+    RunnerConfig,
+    RunResult,
+)
+from shadowtrace.replay.sampler import (
+    SampleRow,
+    sample_chains,
+    sample_traces,
+    top_archetypes_by_volume,
+)
 from shadowtrace.replay.sprt import SPRTConfig, run_sprt
 
 logger = get_logger("cli")
@@ -218,8 +231,28 @@ async def _live_call(candidate: Candidate, sample: SampleRow) -> CallResult:
 @click.option("--n-per-archetype", default=10, show_default=True)
 @click.option("--seed", default=0, show_default=True)
 @click.option("--floor", default=0.90, show_default=True, help="per-archetype SPRT pass-rate floor")
+@click.option(
+    "--chains/--no-chains",
+    default=True,
+    show_default=True,
+    help="also chain-replay the top-2 archetypes by volume (plan.md M3.6)",
+)
+@click.option(
+    "--chain-budget",
+    "chain_budget_usd",
+    type=float,
+    default=0.50,
+    show_default=True,
+    help="per-chain budget sub-cap, independent of --budget (review R6)",
+)
 def run_cmd(
-    budget_usd: float, archetype_id: str | None, n_per_archetype: int, seed: int, floor: float
+    budget_usd: float,
+    archetype_id: str | None,
+    n_per_archetype: int,
+    seed: int,
+    floor: float,
+    chains: bool,
+    chain_budget_usd: float,
 ) -> None:
     """Budget-capped shadow replay: `shadow run --budget 3.00 [--archetype X]`."""
     settings = get_settings()
@@ -248,8 +281,46 @@ def run_cmd(
         )
         return verdict.passed
 
-    runner = ReplayRunner(ladder, grader, _live_call, runner_config)
-    result = asyncio.run(runner.run(run_id, all_samples))
+    # Local-file span export always on (nothing leaves the machine); OTLP
+    # export to a real collector is opt-in only, via env var (plan.md §4.5).
+    tracer_provider = build_tracer_provider(
+        settings.traces_path, otlp_endpoint=os.environ.get("SHADOWTRACE_OTLP_ENDPOINT")
+    )
+    tracer = tracer_provider.get_tracer("shadowtrace.replay")
+    runner = ReplayRunner(ladder, grader, _live_call, runner_config, tracer=tracer)
+
+    async def _do_run() -> tuple[RunResult, list[ChainReplayResult]]:
+        run_result = await runner.run(run_id, all_samples)
+        chain_results: list[ChainReplayResult] = []
+        if chains:
+            top_ids = top_archetypes_by_volume(conn, n=2)
+            top_ids = [a for a in top_ids if archetype_id is None or a == archetype_id]
+            for chain in sample_chains(conn, top_ids, seed=seed):
+                for candidate in ladder:
+                    cr = await runner.run_chain(run_id, chain, candidate, chain_budget_usd)
+                    if cr is not None:
+                        chain_results.append(cr)
+        return run_result, chain_results
+
+    result, chain_results = asyncio.run(_do_run())
+
+    for cr in chain_results:
+        conn.execute(
+            "INSERT INTO replay_results (id, archetype_id, candidate, source_trace_id, verdict, "
+            "cost_usd, latency_ms, grader, run_id, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                cr.id,
+                cr.archetype_id,
+                cr.candidate,
+                cr.session_id,
+                cr.verdict,
+                cr.cost_usd,
+                None,
+                "chain",
+                run_id,
+                cr.ts,
+            ],
+        )
 
     sprt_config = SPRTConfig(p0=floor, p1=max(0.01, floor - 0.10))
     for arch_id in samples_by_archetype:
@@ -279,7 +350,7 @@ def run_cmd(
 
     click.echo(
         f"run={run_id} spend=${result.spend_usd:.2f} stopped={result.stopped_reason} "
-        f"results={len(result.results)}"
+        f"results={len(result.results)} chain_results={len(chain_results)}"
     )
 
 
