@@ -171,3 +171,61 @@ def test_watcher_missing_dir_returns_zero(tmp_path: Path) -> None:
     capture = CaptureWriter(tmp_path / "cap.sqlite3", tmp_path / "spill")
     watcher = TranscriptWatcher(tmp_path / "does-not-exist", capture)
     assert watcher.scan_once() == 0
+
+
+def _tool_result_user_line(uuid: str, ts: str) -> str:
+    """A "user" turn that's actually a tool_result continuation — the
+    overwhelmingly common case in real agentic Claude Code sessions, where
+    most turns are tool calls rather than free-typed human text."""
+    return json.dumps(
+        {
+            "type": "user",
+            "uuid": uuid,
+            "timestamp": ts,
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "file contents here",
+                    }
+                ],
+            },
+        }
+    )
+
+
+def test_tool_result_turns_carry_forward_the_last_real_human_prompt(tmp_path: Path) -> None:
+    """Regression test: on real (heavily agentic) Claude Code data, most
+    'user' turns in a chain are tool_result continuations, not human text.
+    Before this fix, each assistant turn's request_json carried whatever
+    the *immediately preceding* user turn was — usually a tool_result,
+    with no text block — so mining/embed.py had nothing to embed and
+    almost every trace was silently excluded from clustering (observed:
+    3 usable prompts out of 905 real captured traces). The fix: only
+    overwrite the carried-forward prompt when a user turn is genuine human
+    text; tool_result-only turns keep the prior real ask."""
+    path = tmp_path / "session.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                _user_line("u1", "please read config.yaml and summarize it"),
+                _assistant_line("a1", "Let me check that.", ts="2026-07-18T00:00:01Z"),
+                _tool_result_user_line("u2", "2026-07-18T00:00:02Z"),
+                _assistant_line("a2", "It sets the port to 8080.", ts="2026-07-18T00:00:03Z"),
+                _tool_result_user_line("u3", "2026-07-18T00:00:04Z"),
+                _assistant_line("a3", "Done, all good.", ts="2026-07-18T00:00:05Z"),
+            ]
+        )
+        + "\n"
+    )
+
+    tf = TranscriptFile(path)
+    records = tf.poll()
+
+    assert len(records) == 3
+    # every assistant turn in the chain — including the ones following
+    # tool_result-only turns — still carries the original human ask
+    for record in records:
+        assert record.request_json["content"] == "please read config.yaml and summarize it"
