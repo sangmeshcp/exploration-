@@ -40,6 +40,24 @@ logger = get_logger("ingest.claude_transcripts")
 PARSER_VERSION = "1"
 
 
+def _extract_human_text(content: Any) -> str | None:
+    """True human-authored text vs. a tool_result continuation. A plain
+    string is always human text; a content-block list only counts if it
+    has at least one `type: "text"` block — a list of purely `tool_result`
+    blocks (the common case mid-agentic-chain) yields nothing here."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        text = "\n".join(p for p in parts if p)
+        return text or None
+    return None
+
+
 @dataclass
 class TranscriptFile:
     """Incremental tail-parser for a single transcript file.
@@ -104,7 +122,17 @@ class TranscriptFile:
 
         if entry_type == "user":
             if isinstance(message, dict):
-                self._last_user_content = message.get("content")
+                content = message.get("content")
+                if _extract_human_text(content) is not None:
+                    self._last_user_content = content
+                # else: this "user" turn is a tool_result continuation, not
+                # genuine human input (very common in agentic sessions —
+                # most turns are tool calls, not free text). Deliberately
+                # keep the previous _last_user_content in that case, so
+                # every assistant turn in a tool-use chain still carries
+                # the *original* human ask as its prompt, instead of going
+                # prompt-less and getting silently dropped from mining
+                # (mining/embed.py has nothing to embed without it).
             return None
 
         if entry_type != "assistant" or not isinstance(message, dict):
