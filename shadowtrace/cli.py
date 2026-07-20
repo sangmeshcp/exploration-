@@ -32,6 +32,7 @@ from shadowtrace.ingest.etl import backfill_prompt_text, run_etl
 from shadowtrace.mining.archetypes import assign_archetypes
 from shadowtrace.mining.cluster import cluster_embeddings
 from shadowtrace.mining.embed import get_default_embedder
+from shadowtrace.proxy.capture import CaptureWriter
 from shadowtrace.proxy.server import ProxyConfig, create_app
 from shadowtrace.recommend.apply import apply_recommendation
 from shadowtrace.recommend.apply.claude_code import ClaudeCodeWriter
@@ -116,6 +117,37 @@ def up(proxy_port: int, etl_interval: float, watch_interval: float) -> None:
 
     click.echo(f"shadowtrace up: proxy on :{proxy_port}, watching {settings.claude_projects_dir}")
     asyncio.run(_run())
+
+
+@main.command()
+def ingest() -> None:
+    """One-shot backfill of existing (and any newly appended) Claude Code
+    transcripts under `claude_projects_dir` into the capture store, then
+    ETL them into DuckDB — the ingest half of `shadow up`, without booting
+    the proxy server or looping forever. `TranscriptFile` always starts
+    reading each file from byte 0 the first time it sees it (see
+    ingest/claude_transcripts.py), so this picks up your full existing
+    session history, not just messages sent after this runs. Use this to
+    seed shadowtrace from history you already have, or as a manual
+    top-up between `shadow up` runs."""
+    settings = get_settings()
+    settings.ensure_dirs()
+    capture = CaptureWriter(settings.sqlite_path, settings.spill_dir)
+    watcher = TranscriptWatcher(settings.claude_projects_dir, capture)
+
+    async def _scan() -> int:
+        await capture.start()
+        try:
+            return watcher.scan_once()
+        finally:
+            await capture.stop()
+
+    ingested = asyncio.run(_scan())
+    stats = run_etl(settings.sqlite_path, settings.duckdb_path)
+    click.echo(
+        f"ingested {ingested} messages from {settings.claude_projects_dir}; "
+        f"etl inserted={stats.rows_inserted} deduped={stats.rows_deduped}"
+    )
 
 
 @main.command()
