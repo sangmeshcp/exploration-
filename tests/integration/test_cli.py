@@ -265,3 +265,75 @@ def test_ingest_backfills_existing_transcript_history(
     assert "inserted=0" in result2.output
     count = conn.execute("SELECT count(*) FROM traces").fetchone()[0]
     assert count == 1
+
+
+def test_ingest_reset_wipes_stale_data_before_reingesting(
+    _env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--reset exists specifically for recovering from a fixed transcript
+    parser: normal `ingest` dedups by message id and never touches rows
+    it already wrote, so a row captured with a since-fixed bug in
+    request_json construction is stuck that way forever unless the store
+    is wiped and rebuilt from the original (untouched) transcript files."""
+    projects_dir = _env.parent / "claude_projects_reset"
+    projects_dir.mkdir()
+    (projects_dir / "session.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "u1",
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "message": {"role": "user", "content": "a fresh real question"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "a1",
+                        "timestamp": "2026-01-01T00:00:01Z",
+                        "message": {
+                            "role": "assistant",
+                            "model": "claude-sonnet-5",
+                            "content": [{"type": "text", "text": "a fresh real answer"}],
+                            "usage": {"input_tokens": 5, "output_tokens": 5},
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    monkeypatch.setenv("SHADOWTRACE_CLAUDE_PROJECTS_DIR", str(projects_dir))
+    from shadowtrace.common.config import reset_settings_cache
+
+    reset_settings_cache()
+
+    # simulate stale, buggily-captured data already sitting in the store
+    writer = CaptureWriter(_env / "capture.sqlite3", _env / "spill", flush_interval=100.0)
+    writer.enqueue(
+        TraceRecord(
+            id="01STALE0",
+            ts=500,
+            source="transcript",
+            model="claude-sonnet-5",
+            request_json={"role": "user", "content": None},  # the bug: no prompt captured
+            response_json={"content": []},
+            ingest_key="stale-uuid",
+        )
+    )
+    import asyncio
+
+    asyncio.run(writer.flush())
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["ingest", "--reset"])
+    assert result.exit_code == 0
+    assert "reset: capture store wiped" in result.output
+    assert "ingested 1 messages" in result.output
+
+    conn = duckdb_store.connect(_env / "analytics.duckdb")
+    rows = conn.execute("SELECT id, model FROM traces").fetchall()
+    assert len(rows) == 1  # the stale row is gone, only the fresh re-ingest remains
+    assert rows[0][0] != "01STALE0"
