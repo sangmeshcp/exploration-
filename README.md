@@ -22,7 +22,7 @@ docker-compose harness, and the heaviest ML dependency — real
 sentence-transformers — isn't installed in this environment).
 
 ```
-176 tests passing · ruff clean · mypy --strict clean · ~89% coverage
+178 tests passing · ruff clean · mypy --strict clean · ~90% coverage
 ```
 
 ## Quick start
@@ -39,15 +39,42 @@ python -m pytest -m "not e2e and not perf"   # unit + integration (fast)
 python -m pytest -m e2e                      # golden-path end-to-end scenario
 python -m pytest -m perf                     # proxy latency budget check
 
-shadow up                    # start the proxy (API-key lane) + transcript
-                              # watcher (primary lane) + periodic ETL
-shadow pause / shadow resume # toggle the capture bypass flag
-shadow sync                  # force an immediate SQLite -> DuckDB ETL run
+shadow ingest                 # one-shot backfill of EXISTING Claude Code session
+                               # history + ETL — run this first if you already have
+                               # transcripts under ~/.claude/projects/
+shadow up                     # start the proxy (API-key lane) + transcript
+                               # watcher (primary lane) + periodic ETL, forever
+shadow pause / shadow resume  # toggle the capture bypass flag
+shadow sync                   # force an immediate SQLite -> DuckDB ETL run
 shadow cluster                # embed + (re-)cluster prompt text into archetypes
 shadow run --budget 3.00      # budgeted shadow replay + top-2-archetype chain replay
 shadow report [--raw]         # summarize captured traffic
 shadow apply <rec-id> --writer claude_code --output-path ~/.claude/settings.json
 ```
+
+### Building on data you already have
+
+`shadow ingest` seeds shadowtrace from Claude Code sessions you had
+*before* you ever ran this tool — a transcript file is always read from
+byte 0 the first time it's seen (see
+`ingest/claude_transcripts.py`'s docstring), so nothing about capture is
+"forward only." A typical first run:
+
+```bash
+shadow ingest   # backfills every existing ~/.claude/projects/**/*.jsonl + ETL
+shadow cluster  # embed + cluster that history into archetypes
+shadow report   # sanity-check what landed
+shadow run --budget 3.00   # shadow-replay the archetypes you now have
+```
+
+`shadow ingest` is a one-shot command (it exits when done) and doesn't
+boot the proxy server, unlike `shadow up`. It's also safe to re-run —
+each invocation re-scans every transcript from the start (there's no
+persisted per-file offset across process runs, only within one `shadow
+up`'s lifetime), but the capture store's unique index on
+`(source, ingest_key)` makes re-inserts a no-op, so nothing gets
+duplicated. Run it again any time to top up, or just start `shadow up`
+afterward for continuous capture going forward.
 
 Local sentence-transformers / HDBSCAN are optional (`pip install '.[ml]'`)
 — without them, `mining/embed.py` and `mining/cluster.py` fall back to a
@@ -164,10 +191,12 @@ what's actually verified:
 - **Fixture corpus (§3.6):** the full 304 synthetic traces across 8
   archetypes the plan calls for (`tests/fixtures/generate_traces.py`,
   regeneratable, seeded).
-- **CLI command surface:** `resume`, `sync`, `cluster`, and `metrics` are
-  pragmatic additions beyond the five commands (`up`, `pause`, `run`,
-  `report`, `apply`) the plan names in §1 — needed to actually drive the
-  pipeline end to end.
+- **CLI command surface:** `ingest`, `resume`, `sync`, `cluster`, and
+  `metrics` are pragmatic additions beyond the five commands (`up`,
+  `pause`, `run`, `report`, `apply`) the plan names in §1 — needed to
+  actually drive the pipeline end to end (`ingest` specifically: a
+  one-shot backfill of transcript history that predates the tool,
+  without booting the always-on proxy server `up` also starts).
 - **Dashboard visuals:** built and wired to real API data (see above),
   but not eyeballed in an actual browser — no browser was available in
   this environment.

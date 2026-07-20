@@ -200,3 +200,68 @@ async def test_up_wires_real_tracing_into_proxy_and_watcher(_env: Path) -> None:
     lines = settings.traces_path.read_text().strip().split("\n")
     span_names = {json.loads(line)["name"] for line in lines if line}
     assert "proxy_request" in span_names
+
+
+def test_ingest_backfills_existing_transcript_history(
+    _env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """shadow ingest must pick up transcripts that already existed before
+    it ran (TranscriptFile always starts at byte 0 on first sight), not
+    just messages appended afterward — this is the whole point of the
+    command."""
+    projects_dir = _env.parent / "claude_projects"
+    projects_dir.mkdir()
+    (projects_dir / "old_session.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "u1",
+                        "timestamp": "2026-01-01T00:00:00Z",
+                        "message": {"role": "user", "content": "an old pre-existing question"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "a1",
+                        "timestamp": "2026-01-01T00:00:01Z",
+                        "message": {
+                            "role": "assistant",
+                            "model": "claude-sonnet-5",
+                            "content": [{"type": "text", "text": "an old pre-existing answer"}],
+                            "usage": {"input_tokens": 5, "output_tokens": 5},
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    monkeypatch.setenv("SHADOWTRACE_CLAUDE_PROJECTS_DIR", str(projects_dir))
+    from shadowtrace.common.config import reset_settings_cache
+
+    reset_settings_cache()
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["ingest"])
+    assert result.exit_code == 0
+    assert "ingested 1 messages" in result.output
+    assert "inserted=1" in result.output
+
+    conn = duckdb_store.connect(_env / "analytics.duckdb")
+    row = conn.execute("SELECT source, model FROM traces").fetchone()
+    assert row == ("transcript", "claude-sonnet-5")
+
+    # a second run re-reads the file from byte 0 again (each invocation is a
+    # fresh process with no persisted per-file offset — see
+    # ingest/claude_transcripts.py's module docstring), so it re-*parses*
+    # the same message, but the DB-level unique index on (source,
+    # ingest_key) makes the write itself idempotent: no duplicate row.
+    result2 = runner.invoke(main, ["ingest"])
+    assert result2.exit_code == 0
+    assert "ingested 1 messages" in result2.output
+    assert "inserted=0" in result2.output
+    count = conn.execute("SELECT count(*) FROM traces").fetchone()[0]
+    assert count == 1
