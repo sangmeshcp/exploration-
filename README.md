@@ -22,7 +22,7 @@ docker-compose harness, and the heaviest ML dependency — real
 sentence-transformers — isn't installed in this environment).
 
 ```
-180 tests passing · ruff clean · mypy --strict clean · ~90% coverage
+181 tests passing · ruff clean · mypy --strict clean · ~90% coverage
 ```
 
 ## Quick start
