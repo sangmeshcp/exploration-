@@ -31,9 +31,13 @@ sentence-transformers — isn't installed in this environment).
 uv venv .venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
 
-pytest -m "not e2e and not perf"   # unit + integration (fast)
-pytest -m e2e                      # golden-path end-to-end scenario
-pytest -m perf                     # proxy latency budget check
+# Use `python -m pytest`, not bare `pytest` — on some shells (zsh command-hash
+# caching is a common culprit) a bare `pytest` can silently resolve to an
+# unrelated pytest from before the venv was activated, missing every dev
+# dependency below. `python -m pytest` always uses the active venv's pytest.
+python -m pytest -m "not e2e and not perf"   # unit + integration (fast)
+python -m pytest -m e2e                      # golden-path end-to-end scenario
+python -m pytest -m perf                     # proxy latency budget check
 
 shadow up                    # start the proxy (API-key lane) + transcript
                               # watcher (primary lane) + periodic ETL
