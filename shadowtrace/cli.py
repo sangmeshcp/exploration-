@@ -69,6 +69,24 @@ def main() -> None:
     """shadowtrace: personal shadow tracing & model recommender."""
 
 
+def build_up_components(settings: Any) -> tuple[Any, TranscriptWatcher]:
+    """Wires the proxy app and transcript watcher `shadow up` runs, both
+    sharing one real tracer provider (local JSON-lines export by default,
+    opt-in OTLP via SHADOWTRACE_OTLP_ENDPOINT) — split out from `up()`
+    itself so this wiring is unit-testable without booting uvicorn."""
+    tracer_provider = build_tracer_provider(
+        settings.traces_path, otlp_endpoint=os.environ.get("SHADOWTRACE_OTLP_ENDPOINT")
+    )
+    config = ProxyConfig(settings=settings, tracer=tracer_provider.get_tracer("shadowtrace.proxy"))
+    app = create_app(config)
+    watcher = TranscriptWatcher(
+        settings.claude_projects_dir,
+        app.state.capture,
+        tracer=tracer_provider.get_tracer("shadowtrace.ingest"),
+    )
+    return app, watcher
+
+
 @main.command()
 @click.option("--proxy-port", default=8787, show_default=True)
 @click.option("--etl-interval", default=300.0, show_default=True, help="seconds between ETL syncs")
@@ -80,13 +98,9 @@ def up(proxy_port: int, etl_interval: float, watch_interval: float) -> None:
     (primary lane) + periodic ETL, all in one process."""
     settings = get_settings()
     settings.ensure_dirs()
+    app, watcher = build_up_components(settings)
 
     async def _run() -> None:
-        config = ProxyConfig(settings=settings)
-        app = create_app(config)
-        capture = app.state.capture
-        watcher = TranscriptWatcher(settings.claude_projects_dir, capture)
-
         async def etl_loop() -> None:
             while True:
                 try:

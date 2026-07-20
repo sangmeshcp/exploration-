@@ -1,3 +1,4 @@
+import contextlib
 import json
 from pathlib import Path
 
@@ -168,3 +169,34 @@ def test_run_with_no_data_does_not_crash(_env: Path) -> None:
     result = runner.invoke(main, ["run", "--budget", "1.0"])
     assert result.exit_code == 0
     assert "no eligible traces" in result.output
+
+
+async def test_up_wires_real_tracing_into_proxy_and_watcher(_env: Path) -> None:
+    """Regression test: `shadow up` must actually wire a real tracer into
+    both the proxy and the transcript watcher (not silently fall back to
+    the no-op default), since the README documents proxy/ingest tracing
+    as on-by-default. Exercises build_up_components() directly rather
+    than booting the real uvicorn server `up()` runs."""
+    import httpx
+
+    from shadowtrace.cli import build_up_components
+    from shadowtrace.common.config import get_settings
+
+    settings = get_settings()
+    settings.ensure_dirs()
+    app, watcher = build_up_components(settings)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+    ) as client:
+        # any request is fine here — we only care that a proxy_request span
+        # gets emitted, not that it succeeds against a real upstream
+        with contextlib.suppress(httpx.HTTPError):
+            await client.post("/v1/messages", json={"model": "x", "messages": []}, timeout=2.0)
+
+    watcher.scan_once()
+
+    assert settings.traces_path.exists()
+    lines = settings.traces_path.read_text().strip().split("\n")
+    span_names = {json.loads(line)["name"] for line in lines if line}
+    assert "proxy_request" in span_names
