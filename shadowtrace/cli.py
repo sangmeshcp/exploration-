@@ -120,7 +120,19 @@ def up(proxy_port: int, etl_interval: float, watch_interval: float) -> None:
 
 
 @main.command()
-def ingest() -> None:
+@click.option(
+    "--reset",
+    is_flag=True,
+    help=(
+        "Wipe the capture store first, then re-ingest everything from scratch. "
+        "Re-running `ingest` normally skips messages it's already seen (deduped "
+        "by message id) — that's the right default for topping up, but it means "
+        "a transcript-parser improvement never touches already-captured rows "
+        "unless you start over. Use --reset after upgrading shadowtrace if "
+        "clustering looks worse than it should."
+    ),
+)
+def ingest(reset: bool) -> None:
     """One-shot backfill of existing (and any newly appended) Claude Code
     transcripts under `claude_projects_dir` into the capture store, then
     ETL them into DuckDB — the ingest half of `shadow up`, without booting
@@ -132,6 +144,11 @@ def ingest() -> None:
     top-up between `shadow up` runs."""
     settings = get_settings()
     settings.ensure_dirs()
+    if reset:
+        for suffix in ("", "-wal", "-shm"):
+            Path(f"{settings.sqlite_path}{suffix}").unlink(missing_ok=True)
+        settings.duckdb_path.unlink(missing_ok=True)
+        click.echo("reset: capture store wiped, re-ingesting from scratch")
     capture = CaptureWriter(settings.sqlite_path, settings.spill_dir)
     watcher = TranscriptWatcher(settings.claude_projects_dir, capture)
 

@@ -22,7 +22,7 @@ docker-compose harness, and the heaviest ML dependency — real
 sentence-transformers — isn't installed in this environment).
 
 ```
-178 tests passing · ruff clean · mypy --strict clean · ~90% coverage
+180 tests passing · ruff clean · mypy --strict clean · ~90% coverage
 ```
 
 ## Quick start
@@ -42,6 +42,9 @@ python -m pytest -m perf                     # proxy latency budget check
 shadow ingest                 # one-shot backfill of EXISTING Claude Code session
                                # history + ETL — run this first if you already have
                                # transcripts under ~/.claude/projects/
+shadow ingest --reset         # wipe the capture store and re-ingest from scratch —
+                               # use after upgrading shadowtrace if a parser fix
+                               # should apply to data you already captured
 shadow up                     # start the proxy (API-key lane) + transcript
                                # watcher (primary lane) + periodic ETL, forever
 shadow pause / shadow resume  # toggle the capture bypass flag
@@ -75,6 +78,19 @@ up`'s lifetime), but the capture store's unique index on
 `(source, ingest_key)` makes re-inserts a no-op, so nothing gets
 duplicated. Run it again any time to top up, or just start `shadow up`
 afterward for continuous capture going forward.
+
+That same dedup-by-id behavior has a downside: if a transcript-parsing bug
+gets fixed in a shadowtrace upgrade, plain `shadow ingest` will **not**
+retroactively repair rows it already captured under the old, buggy parser
+— it only ever inserts rows it hasn't seen before. `shadow ingest --reset`
+wipes the capture store and DuckDB analytics store first, then re-ingests
+everything from the original (untouched) transcript files, so a parser fix
+actually reaches your existing history:
+
+```bash
+shadow ingest --reset
+shadow cluster
+```
 
 Local sentence-transformers / HDBSCAN are optional (`pip install '.[ml]'`)
 — without them, `mining/embed.py` and `mining/cluster.py` fall back to a
