@@ -6,7 +6,8 @@ archetypes, budget-caps a shadow replay against cheaper/local candidate
 models, and recommends (and can apply) a router config that reclaims
 subscription quota headroom or API spend.
 
-Design doc: [`plan.md`](./plan.md).
+Design doc: [`plan.md`](./plan.md). Evaluation, monitoring and SLOs:
+[`docs/observability-and-evals.md`](./docs/observability-and-evals.md).
 
 ## Status
 
@@ -22,7 +23,7 @@ docker-compose harness, and the heaviest ML dependency — real
 sentence-transformers — isn't installed in this environment).
 
 ```
-178 tests passing · ruff clean · mypy --strict clean · ~90% coverage
+234 tests passing · ruff clean · mypy --strict clean · ~93% coverage
 ```
 
 ## Quick start
@@ -43,13 +44,22 @@ shadow ingest                 # one-shot backfill of EXISTING Claude Code sessio
                                # history + ETL — run this first if you already have
                                # transcripts under ~/.claude/projects/
 shadow up                     # start the proxy (API-key lane) + transcript
-                               # watcher (primary lane) + periodic ETL, forever
+                               # watcher (primary lane) + periodic ETL + SLO/alert
+                               # loop + dashboard and /metrics on :8788, forever
 shadow pause / shadow resume  # toggle the capture bypass flag
 shadow sync                   # force an immediate SQLite -> DuckDB ETL run
 shadow cluster                # embed + (re-)cluster prompt text into archetypes
-shadow run --budget 3.00      # budgeted shadow replay + top-2-archetype chain replay
-shadow report [--raw]         # summarize captured traffic
+shadow run --budget 3.00      # budgeted shadow replay + top-2-archetype chain replay,
+                               # graded by the eval suite (format, completion,
+                               # trajectory, grounding, judge)
+shadow recommend              # turn passing SPRT verdicts into recommendations
 shadow apply <rec-id> --writer claude_code --output-path ~/.claude/settings.json
+shadow report [--raw]         # summarize captured traffic
+shadow evals                  # per-scorer results + judge reliability
+shadow review                 # label judge verdicts by hand (human-in-the-loop)
+shadow monitor                # drift, data quality, week-over-week performance
+shadow slo [--notify]         # SLOs, alert rules, error budgets (exit 1 on breach)
+shadow dashboard              # web UI + /metrics on its own (`up` already serves it)
 ```
 
 ### Building on data you already have
@@ -101,14 +111,14 @@ npm install && npm run build   # or `npm run dev` for hot-reload against
                                 # a `shadow up`-style backend on :8788
 ```
 
-`shadowtrace/dashboard/api.py` serves `/api/*` over DuckDB plus
-`/healthz`/`/readyz`, and mounts `dashboard/web/dist/` if present. Verified
-end-to-end in this session: built the React bundle, seeded a DuckDB
-analytics store, ran the FastAPI backend, and confirmed both `/api/summary`
-returned real seeded data and `/` served the built `index.html` with
-correctly-referenced asset paths. No real browser was available in this
-environment, so the pixels themselves weren't eyeballed — worth a manual
-`npm run dev` + look before you rely on it for anything visual.
+`shadowtrace/dashboard/api.py` serves `/api/*` over DuckDB, `/healthz` and
+`/readyz` (analytics store present, state directory writable, at least 2GB
+free), and `/metrics` in Prometheus format. It mounts `dashboard/web/dist/`
+if present. `shadow up` serves it on `:8788`; `shadow dashboard` serves it
+on its own. The **Health** tab shows SLOs with error budgets, firing alerts,
+drift, data quality, week-over-week candidate performance and eval results.
+It has been checked in headless Chromium at desktop and phone widths; the
+older tabs have not.
 
 ## Repo layout
 
@@ -160,15 +170,16 @@ what's actually verified:
   uninstalled on size/time grounds). The fallback hashing embedder is
   what every test actually exercises for embeddings; HDBSCAN's real
   backend (lighter, no torch) *was* installed and verified — see above.
-- **Judge grader:** `replay/graders/judge.py`'s default is a crude
-  token-overlap heuristic, not a live cheap-model call — this is
-  deliberate (CI must never need a live API key), and the module is
-  built so a real `judge_fn` drops in without changing call sites.
-- **Replay call wiring (`cli.py::_live_call`):** real HTTP wiring to
-  Anthropic/Ollama, with its request/response handling verified against
-  mocked endpoints (`tests/unit/test_cli_live_call.py`, via `respx` — no
-  real network). Never exercised against the *actual* Anthropic/Ollama
-  APIs in this session.
+- **Judge grader:** with an API key set and `pip install '.[judge]'`, the
+  judge is `claude-haiku-5-5` via the Anthropic SDK
+  (`replay/graders/llm_judge.py`), and its cost counts against `--budget`.
+  Without a key it falls back to a crude local token-overlap heuristic, so CI
+  never needs a live key. `shadow run` prints which one it is using.
+- **Replay call wiring (`replay/providers.py`):** real HTTP calls to
+  Anthropic, Ollama, vLLM and OpenRouter. They send the stored conversation,
+  system prompt and tools, and return text plus tool calls. Verified against
+  mocked endpoints only (`respx`, no real network); never exercised against
+  the actual provider APIs.
 - **Transcript schema:** `ingest/claude_transcripts.py` parses a
   best-effort model of Claude Code's JSONL transcript format (based on
   general knowledge of its shape, not a verified spec) — defensively, so
@@ -191,15 +202,17 @@ what's actually verified:
 - **Fixture corpus (§3.6):** the full 304 synthetic traces across 8
   archetypes the plan calls for (`tests/fixtures/generate_traces.py`,
   regeneratable, seeded).
-- **CLI command surface:** `ingest`, `resume`, `sync`, `cluster`, and
-  `metrics` are pragmatic additions beyond the five commands (`up`,
-  `pause`, `run`, `report`, `apply`) the plan names in §1 — needed to
-  actually drive the pipeline end to end (`ingest` specifically: a
-  one-shot backfill of transcript history that predates the tool,
-  without booting the always-on proxy server `up` also starts).
-- **Dashboard visuals:** built and wired to real API data (see above),
-  but not eyeballed in an actual browser — no browser was available in
-  this environment.
+- **CLI command surface:** beyond the five commands the plan names in §1
+  (`up`, `pause`, `run`, `report`, `apply`), there are pipeline additions
+  (`ingest`, `resume`, `sync`, `cluster`, `recommend`), evaluation commands
+  (`evals`, `review`) and monitoring commands (`monitor`, `slo`,
+  `dashboard`, `metrics`). `ingest` is a one-shot backfill of transcript
+  history that predates the tool, without booting the always-on proxy server
+  that `up` also starts.
+- **Dashboard visuals:** the Health tab (SLOs, alerts, drift, data quality,
+  performance, evals) was rendered in headless Chromium against seeded data
+  at desktop and phone widths, light and dark. The older tabs haven't been
+  checked visually.
 
 Everything else — redaction (regex + entropy quarantine), fail-open
 capture with JSONL spill under real lock contention, byte-identical

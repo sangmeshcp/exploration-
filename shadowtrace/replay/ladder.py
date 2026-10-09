@@ -16,6 +16,11 @@ class Candidate:
     price_per_mtok_in: float
     price_per_mtok_out: float
     local: bool = False
+    model: str | None = None  # provider-side model id, when it differs from `name`
+
+    @property
+    def provider_model(self) -> str:
+        return self.model or self.name
 
     def cost_usd(self, tokens_in: int, tokens_out: int) -> float:
         if self.local:
@@ -43,6 +48,7 @@ def parse_ladder_yaml(text: str) -> list[Candidate]:
                 price_per_mtok_in=float(entry.get("price_per_mtok_in", 0.0)),
                 price_per_mtok_out=float(entry.get("price_per_mtok_out", 0.0)),
                 local=bool(entry.get("local", False)),
+                model=entry.get("model"),
             )
         )
     return candidates

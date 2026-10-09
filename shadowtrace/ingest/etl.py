@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from shadowtrace.common.instrument import instrument
 from shadowtrace.common.logging import get_logger
 from shadowtrace.common.metrics import REGISTRY
 from shadowtrace.db import duckdb_store
@@ -61,6 +62,7 @@ def _fetch_sqlite_rows(sqlite_path: Path) -> list[sqlite3.Row]:
         conn.close()
 
 
+@instrument("etl.run", component="etl")
 def run_etl(sqlite_path: Path, duckdb_path: Path) -> ETLStats:
     stats = ETLStats()
     try:
@@ -130,6 +132,7 @@ def extract_prompt_text(request_json_raw: str) -> str | None:
     return None
 
 
+@instrument("etl.backfill_prompt_text", component="etl")
 def backfill_prompt_text(duckdb_path: Path) -> int:
     conn = duckdb_store.connect(duckdb_path)
     try:

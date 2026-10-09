@@ -94,9 +94,25 @@ def build_tracer_provider(traces_path: Path, otlp_endpoint: str | None = None) -
     return provider
 
 
-def get_default_tracer() -> trace.Tracer:
-    """A provider-less tracer: spans it creates are real objects with the
-    OTel API shape but are never exported anywhere. Safe fallback for any
+_process_provider: TracerProvider | None = None
+
+
+def register_process_tracer_provider(provider: TracerProvider | None) -> None:
+    """Make `provider` what `get_default_tracer()` hands out for the rest of
+    this process. Unlike OTel's `set_tracer_provider()` this can be called
+    again (or with None to clear it), so tests stay isolated. The CLI calls
+    it once per command so code instrumented via `common.instrument` exports
+    spans without every call site threading a tracer through."""
+    global _process_provider
+    _process_provider = provider
+
+
+def get_default_tracer(name: str = "shadowtrace") -> trace.Tracer:
+    """The registered process provider's tracer if there is one, otherwise a
+    provider-less tracer: spans it creates are real objects with the OTel
+    API shape but are never exported anywhere. Safe fallback for any
     component that isn't handed an explicit tracer (e.g. in tests that
     don't care about tracing output)."""
-    return trace.get_tracer("shadowtrace")
+    if _process_provider is not None:
+        return _process_provider.get_tracer(name)
+    return trace.get_tracer(name)

@@ -101,3 +101,35 @@ CREATE TABLE IF NOT EXISTS spot_checks (
     result VARCHAR NOT NULL,       -- pass|fail
     ts BIGINT NOT NULL
 );
+
+-- One row per (replay result, scorer) — see replay/graders/scorers.py.
+CREATE TABLE IF NOT EXISTS eval_scores (
+    replay_result_id VARCHAR NOT NULL,
+    run_id VARCHAR NOT NULL,
+    archetype_id VARCHAR NOT NULL,
+    candidate VARCHAR NOT NULL,
+    scorer VARCHAR NOT NULL,
+    value DOUBLE NOT NULL,
+    passed BOOLEAN NOT NULL,
+    detail VARCHAR,
+    ts BIGINT NOT NULL,
+    PRIMARY KEY (replay_result_id, scorer)
+);
+
+-- Human-in-the-loop labels for judge-graded replay results (plan.md M4.5).
+CREATE TABLE IF NOT EXISTS human_reviews (
+    replay_result_id VARCHAR PRIMARY KEY,
+    human_verdict VARCHAR,          -- pass|fail, NULL while still queued
+    note VARCHAR,
+    queued_ts BIGINT NOT NULL,
+    reviewed_ts BIGINT
+);
+
+-- Stored SLO/alert evaluations, for attainment and error budgets (monitor/slo.py).
+CREATE TABLE IF NOT EXISTS slo_evaluations (
+    objective VARCHAR NOT NULL,
+    ts BIGINT NOT NULL,
+    value DOUBLE,
+    ok BOOLEAN NOT NULL,
+    PRIMARY KEY (objective, ts)
+);

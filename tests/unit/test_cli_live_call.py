@@ -2,6 +2,8 @@
 HTTP endpoints (respx) — the actual network call is real code, but no
 real network is touched in CI."""
 
+import json
+
 import httpx
 import pytest
 import respx
@@ -17,6 +19,7 @@ OLLAMA_CANDIDATE = Candidate(
     price_per_mtok_in=0,
     price_per_mtok_out=0,
     local=True,
+    model="llama3.1:8b",
 )
 ANTHROPIC_CANDIDATE = Candidate(
     name="claude-haiku-4-5", provider="anthropic", price_per_mtok_in=1.0, price_per_mtok_out=5.0
@@ -37,9 +40,14 @@ SAMPLE = SampleRow(
 @pytest.mark.asyncio
 @respx.mock
 async def test_live_call_ollama_success() -> None:
-    route = respx.post("http://localhost:11434/api/generate").mock(
+    route = respx.post("http://localhost:11434/api/chat").mock(
         return_value=httpx.Response(
-            200, json={"response": "hi there", "prompt_eval_count": 12, "eval_count": 7}
+            200,
+            json={
+                "message": {"role": "assistant", "content": "hi there"},
+                "prompt_eval_count": 12,
+                "eval_count": 7,
+            },
         )
     )
     result = await _live_call(OLLAMA_CANDIDATE, SAMPLE)
@@ -48,14 +56,15 @@ async def test_live_call_ollama_success() -> None:
     assert result.tokens_in == 12
     assert result.tokens_out == 7
 
-    sent_body = respx.calls.last.request.content
-    assert b"ollama-llama3.1-8b" in sent_body
+    sent = json.loads(respx.calls.last.request.content)
+    assert sent["model"] == "llama3.1:8b"
+    assert sent["messages"] == [{"role": "user", "content": "hello"}]
 
 
 @pytest.mark.asyncio
 @respx.mock
 async def test_live_call_ollama_429_raises_rate_limit_error() -> None:
-    respx.post("http://localhost:11434/api/generate").mock(return_value=httpx.Response(429))
+    respx.post("http://localhost:11434/api/chat").mock(return_value=httpx.Response(429))
     with pytest.raises(RateLimitError):
         await _live_call(OLLAMA_CANDIDATE, SAMPLE)
 

@@ -63,6 +63,11 @@ class Settings:
     def ladder_config_path(self) -> Path:
         return self.home / "ladder.yaml"
 
+    @property
+    def slo_rules_path(self) -> Path:
+        """User override for monitor/slo_rules.yaml; replaces it when present."""
+        return self.home / "slo_rules.yaml"
+
     def ensure_dirs(self) -> None:
         for d in (self.home, self.spill_dir, self.logs_dir, self.checkpoints_dir):
             d.mkdir(parents=True, exist_ok=True)

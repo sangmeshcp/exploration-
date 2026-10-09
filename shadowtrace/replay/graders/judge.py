@@ -33,7 +33,17 @@ Candidate answer (to grade):
 Respond with exactly one word: PASS or FAIL.
 """
 
-JudgeFn = Callable[[str, str, str], Awaitable[bool]]
+
+@dataclass
+class JudgeVerdict:
+    """What a judge_fn may return instead of a bare bool, when the verdict
+    cost money (an LLM judge) that the replay budget should account for."""
+
+    passed: bool
+    cost_usd: float = 0.0
+
+
+JudgeFn = Callable[[str, str, str], Awaitable[bool | JudgeVerdict]]
 
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
@@ -56,6 +66,7 @@ class JudgeResult:
     passed: bool
     prompt_version: str
     result_hash: str
+    cost_usd: float = 0.0
 
 
 def _stamp_hash(rubric: str, frontier_answer: str, candidate_answer: str, passed: bool) -> str:
@@ -70,9 +81,11 @@ async def judge(
     judge_fn: JudgeFn | None = None,
 ) -> JudgeResult:
     fn = judge_fn or heuristic_judge
-    passed = await fn(rubric, frontier_answer, candidate_answer)
+    outcome = await fn(rubric, frontier_answer, candidate_answer)
+    verdict = outcome if isinstance(outcome, JudgeVerdict) else JudgeVerdict(passed=bool(outcome))
     return JudgeResult(
-        passed=passed,
+        passed=verdict.passed,
         prompt_version=JUDGE_PROMPT_VERSION,
-        result_hash=_stamp_hash(rubric, frontier_answer, candidate_answer, passed),
+        result_hash=_stamp_hash(rubric, frontier_answer, candidate_answer, verdict.passed),
+        cost_usd=verdict.cost_usd,
     )

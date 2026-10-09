@@ -45,6 +45,94 @@ export interface SystemInfo {
   paused: boolean;
 }
 
+export interface SloEvaluation {
+  name: string;
+  kind: "slo" | "alert";
+  severity: "info" | "warning" | "critical";
+  sli: string;
+  value: number | null;
+  op: string;
+  threshold: number;
+  status: "ok" | "breach" | "no_data" | "error";
+  description: string;
+  ts: number;
+}
+
+export interface SloCompliance {
+  name: string;
+  target: number;
+  window_days: number;
+  n: number;
+  attainment: number | null;
+  error_budget_remaining: number | null;
+}
+
+export interface SloStatus {
+  evaluations: SloEvaluation[];
+  firing: SloEvaluation[];
+  compliance: Record<string, SloCompliance>;
+}
+
+export interface DriftResult {
+  feature: string;
+  psi: number | null;
+  js_divergence: number | null;
+  status: "stable" | "moderate" | "significant" | "insufficient_data";
+  baseline_n: number;
+  recent_n: number;
+  top_shifts: { key: string; baseline_share: number; recent_share: number; delta: number }[];
+}
+
+export interface QualityCheck {
+  name: string;
+  value: number | null;
+  threshold: number;
+  ok: boolean | null;
+  description: string;
+}
+
+export interface PairPerformance {
+  archetype_id: string;
+  archetype_label: string;
+  candidate: string;
+  recent_n: number;
+  recent_pass_rate: number | null;
+  recent_ci: [number, number] | null;
+  previous_n: number;
+  previous_pass_rate: number | null;
+  mean_latency_ms: number | null;
+  z: number | null;
+  degraded: boolean;
+}
+
+export interface MonitorReport {
+  drift: DriftResult[];
+  quality: QualityCheck[];
+  performance: PairPerformance[];
+}
+
+export interface ScorerSummary {
+  archetype_id: string;
+  archetype_label: string;
+  candidate: string;
+  scorer: string;
+  n: number;
+  mean_value: number;
+  pass_rate: number;
+}
+
+export interface EvalsReport {
+  scorers: ScorerSummary[];
+  judge_agreement: {
+    n: number;
+    agreement: number | null;
+    cohen_kappa: number | null;
+    false_pass_rate: number | null;
+    false_fail_rate: number | null;
+  };
+  pending_reviews: number;
+}
+
 async function getJSON<T>(path: string): Promise<T> {
   const res = await fetch(path);
   if (!res.ok) {
@@ -60,4 +148,7 @@ export const api = {
     getJSON(archetypeId ? `/api/traces?archetype_id=${encodeURIComponent(archetypeId)}` : "/api/traces"),
   recommendations: (): Promise<Recommendation[]> => getJSON("/api/recommendations"),
   system: (): Promise<SystemInfo> => getJSON("/api/system"),
+  slo: (): Promise<SloStatus> => getJSON("/api/slo"),
+  monitor: (): Promise<MonitorReport> => getJSON("/api/monitor"),
+  evals: (): Promise<EvalsReport> => getJSON("/api/evals"),
 };

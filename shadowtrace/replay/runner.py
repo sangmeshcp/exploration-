@@ -38,10 +38,12 @@ from typing import Any, Protocol
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 
+from shadowtrace.common.instrument import genai_attributes
 from shadowtrace.common.logging import get_logger
 from shadowtrace.common.metrics import REGISTRY
 from shadowtrace.common.tracing import get_default_tracer
 from shadowtrace.common.ulid import new_ulid
+from shadowtrace.replay.graders.scorers import Grade, Score
 from shadowtrace.replay.ladder import Candidate
 from shadowtrace.replay.sampler import ReplayChain, SampleRow
 
@@ -59,6 +61,7 @@ class CallResult:
     tokens_in: int
     tokens_out: int
     latency_ms: int
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 class CallFn(Protocol):
@@ -66,7 +69,15 @@ class CallFn(Protocol):
 
 
 class GraderFn(Protocol):
-    async def __call__(self, sample: SampleRow, result: CallResult) -> bool: ...
+    """Returns a bare pass/fail, or a `Grade` carrying per-scorer detail."""
+
+    async def __call__(self, sample: SampleRow, result: CallResult) -> bool | Grade: ...
+
+
+def _as_grade(outcome: bool | Grade) -> Grade:
+    if isinstance(outcome, Grade):
+        return outcome
+    return Grade(passed=bool(outcome), scores=[])
 
 
 @dataclass
@@ -81,6 +92,8 @@ class ReplayResult:
     grader: str
     run_id: str
     ts: int
+    response_text: str = ""
+    scores: list[Score] = field(default_factory=list)
 
 
 @dataclass
@@ -95,6 +108,8 @@ class ChainReplayResult:
     run_id: str
     ts: int
     confidence: str = "chain"  # vs. "single_call" elsewhere — see module docstring
+    response_text: str = ""
+    scores: list[Score] = field(default_factory=list)
 
 
 def _extract_user_content(request_json_raw: str) -> Any:
@@ -227,8 +242,12 @@ class ReplayRunner:
                         "candidate": candidate.name,
                         "archetype_id": sample.archetype_id,
                         "trace_id": sample.trace_id,
+                        **genai_attributes(
+                            provider=candidate.provider, request_model=candidate.provider_model
+                        ),
                     },
                 ) as call_span:
+                    call_start = time.perf_counter()
                     try:
                         call_result = await self._call_with_backoff(candidate, sample)
                     except Exception:
@@ -239,14 +258,29 @@ class ReplayRunner:
                         )
                         call_span.set_status(Status(StatusCode.ERROR))
                         return None
+                    if not call_result.latency_ms:
+                        call_result.latency_ms = int((time.perf_counter() - call_start) * 1000)
                     call_span.set_attribute("tokens_in", call_result.tokens_in)
                     call_span.set_attribute("tokens_out", call_result.tokens_out)
+                    call_span.set_attribute("gen_ai.usage.input_tokens", call_result.tokens_in)
+                    call_span.set_attribute("gen_ai.usage.output_tokens", call_result.tokens_out)
+                    REGISTRY.observe(
+                        "replay_call_latency_ms",
+                        call_result.latency_ms,
+                        labels={"candidate": candidate.name},
+                    )
 
                     with self.tracer.start_as_current_span("grader") as grader_span:
-                        passed = await self.grader(sample, call_result)
+                        grade = _as_grade(await self.grader(sample, call_result))
+                        passed = grade.passed
                         grader_span.set_attribute("verdict", "pass" if passed else "fail")
+                        for score in grade.scores:
+                            grader_span.set_attribute(f"score.{score.name}", score.value)
 
-                    cost = candidate.cost_usd(call_result.tokens_in, call_result.tokens_out)
+                    cost = (
+                        candidate.cost_usd(call_result.tokens_in, call_result.tokens_out)
+                        + grade.cost_usd
+                    )
                     call_span.set_attribute("cost_usd", cost)
                     result = ReplayResult(
                         id=new_ulid(),
@@ -259,6 +293,8 @@ class ReplayRunner:
                         grader=self.config.grader_name,
                         run_id=run_id,
                         ts=int(time.time() * 1000),
+                        response_text=call_result.response_text,
+                        scores=grade.scores,
                     )
                     async with lock:
                         checkpoint.spend_usd += cost
@@ -365,8 +401,10 @@ class ReplayRunner:
                 session_id=last_step.session_id,
             )
             with self.tracer.start_as_current_span("grader") as grader_span:
-                passed = await self.grader(final_sample, last_result)
+                grade = _as_grade(await self.grader(final_sample, last_result))
+                passed = grade.passed
                 grader_span.set_attribute("verdict", "pass" if passed else "fail")
+            chain_spend += grade.cost_usd
 
             REGISTRY.inc(
                 "replay_spend_usd", value=chain_spend, labels={"candidate": candidate.name}
@@ -390,4 +428,6 @@ class ReplayRunner:
                 n_steps=executed_steps,
                 run_id=run_id,
                 ts=int(time.time() * 1000),
+                response_text=last_result.response_text,
+                scores=grade.scores,
             )

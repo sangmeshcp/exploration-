@@ -100,8 +100,26 @@ def build_recommendations(
     expires = now + EXPIRY_DAYS * 86_400_000
     currency = select_currency(access_mode)
 
+    # Latest verdict per (archetype, candidate) only — a pair that passed in
+    # an old run and failed in the latest one must not be recommended — and
+    # nothing for pairs that already have an unexpired recommendation, so
+    # re-running is idempotent.
     verdicts = conn.execute(
-        "SELECT archetype_id, candidate, n_samples, n_pass FROM sprt_verdicts WHERE state = 'pass'"
+        """
+        SELECT v.archetype_id, v.candidate, v.n_samples, v.n_pass
+        FROM sprt_verdicts v
+        WHERE v.state = 'pass'
+          AND v.ts = (
+              SELECT max(v2.ts) FROM sprt_verdicts v2
+              WHERE v2.archetype_id = v.archetype_id AND v2.candidate = v.candidate
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM recommendations r
+              WHERE r.archetype_id = v.archetype_id AND r.candidate = v.candidate
+                AND r.expires_ts > ?
+          )
+        """,
+        [now],
     ).fetchall()
 
     recommendations: list[Recommendation] = []

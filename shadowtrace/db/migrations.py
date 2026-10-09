@@ -63,7 +63,7 @@ def migrate_sqlite(conn: Any, target_version: int = SQLITE_CURRENT_VERSION) -> i
 
 # --- DuckDB ---
 
-DUCKDB_CURRENT_VERSION = 2
+DUCKDB_CURRENT_VERSION = 3
 
 
 def _duckdb_v2_add_notes_column(conn: Any) -> None:
@@ -72,8 +72,17 @@ def _duckdb_v2_add_notes_column(conn: Any) -> None:
         conn.execute("ALTER TABLE traces ADD COLUMN notes VARCHAR")
 
 
+def _duckdb_v3_add_replay_response_text(conn: Any) -> None:
+    """Keep the candidate's answer next to its verdict, so a human reviewer
+    (and any later re-grading with a new scorer) sees what was judged."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info('replay_results')").fetchall()}
+    if "response_text" not in cols:
+        conn.execute("ALTER TABLE replay_results ADD COLUMN response_text VARCHAR")
+
+
 DUCKDB_MIGRATIONS: dict[int, Migration] = {
     2: _duckdb_v2_add_notes_column,
+    3: _duckdb_v3_add_replay_response_text,
 }
 
 
