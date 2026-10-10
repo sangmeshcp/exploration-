@@ -448,8 +448,8 @@ tests/                # unit/, integration/, e2e/, perf/, fakes/, fixtures/
 docs/                 # design notes
 ```
 
-[`plan.md`](plan.md) is the original design document, kept for background on
-why things are built the way they are.
+[`plan.md`](plan.md) covers the design decisions, architecture and roadmap:
+what's built, what's partial and what's next.
 
 ## Limitations
 

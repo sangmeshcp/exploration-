@@ -1,273 +1,281 @@
-# plan.md — Personal Shadow Tracing & Model Recommender
+# shadowtrace: design and roadmap
 
-> Implementation plan for Claude Code. Source design: `personal-shadow-tracing-hld.md`.
-> Local-first, single-user app: capture own LLM traffic → cluster into task archetypes → budgeted shadow replay → objective-aware model recommendations → apply as router config.
+This document explains how shadowtrace is designed and why, and tracks what is
+built and what is left. For installation and usage, see the
+[README](README.md). For evaluation, monitoring and SLO internals, see
+[docs/observability-and-evals.md](docs/observability-and-evals.md).
+
+Section and item IDs (§3.3, M3.6, D1, R4, E10, ...) are stable. Code comments
+refer to them, so keep them when editing.
+
+**Status labels:** **Done** means it's built and tested. **Partial** means the
+core works but something listed is missing. **Not started** means just that.
 
 ---
 
-## 0. Decisions (RESOLVED 2026-07-13)
+## 0. Goals and key decisions
 
-| # | Decision | Resolution |
+### Goals
+
+- Tell a single user which of their LLM workloads a cheaper or local model can
+  handle, using evidence from their own traffic rather than public benchmarks.
+- Turn that evidence into a routing change they can review, apply and undo.
+- Keep watching afterwards: performance over time, workload drift and pipeline
+  health.
+
+### Non-goals
+
+- Multi-user or hosted deployment. shadowtrace is a local, single-user tool.
+- Routing requests itself. It writes routing decisions for other tools to
+  enforce.
+- General-purpose benchmarking on curated datasets.
+
+### Decisions
+
+| # | Decision | Why |
 |---|---|---|
-| D1 | Claude access mode | **Subscription (Max/Pro) via Claude Code** |
-| D2 | v0 dashboard stack | **FastAPI + React from start** |
-| D3 | Local model candidates | **Yes — Ollama/vLLM lane enabled by default (local GPU available)** |
-| D4 | Proxy implementation | Custom FastAPI shim (~500 LoC) — proxy is now the *secondary* lane, see D1 consequences |
-| D5 | Embeddings | Local sentence-transformers (privacy default; GPU makes this free) |
-
-**D1 consequences (important — reshapes M1):**
-1. **Primary capture = Claude Code local session transcripts.** Claude Code persists full session JSONL under `~/.claude/projects/<project>/*.jsonl` (complete message lists incl. tool_use). A file-watcher ingester on these transcripts captures the main lane with zero proxy involvement and zero risk of breaking OAuth-bound subscription auth. Supplement with Claude Code hooks (session metadata) + built-in OTel (token metrics).
-2. **Proxy demoted to secondary lane:** API-key scripts, Codex/other CLIs, and anything with a `base_url` knob. Still built in M1, still fail-open, but no longer the critical path.
-3. **Recommender currency = frontier quota headroom** (subscription is flat-rate): "route archetypes X,Y to Haiku/local → reclaim ~N% of your 5-hour/weekly limits." Dollar savings shown only for the API-key lane.
-4. **Replay needs a separate metered API key** — subscription auth can't be used for programmatic replay calls. Budget caps in `shadow run` apply to this key. Local Ollama/vLLM candidates (D3) reduce replay spend to ~zero for archetypes where local models are viable.
+| D1 | Claude Code transcripts are the primary capture source; the proxy is secondary | Subscription (Pro/Max) logins can't be routed through a custom base URL reliably, but Claude Code writes complete session transcripts to `~/.claude/projects/`. Reading those captures the main tool with no proxy and no risk to login. |
+| D1.3 | Savings are measured in quota headroom on a subscription, and in dollars only on API keys | A subscription is flat-rate, so the useful number is how much of the usage limit a routing change frees up. |
+| D1.4 | Replay uses a separate metered API key | Subscription credentials can't be used for programmatic calls. `--budget` caps spend on that key. |
+| D2 | FastAPI backend with a React + Vite + Tailwind dashboard | One process serves the API, `/metrics` and the UI. |
+| D3 | Local models (Ollama, vLLM) are first-class replay candidates | They cost nothing, so they're worth trying before any paid model. |
+| D4 | A small custom proxy instead of an off-the-shelf gateway | The proxy must be byte-transparent and fail open; a few hundred lines are easier to guarantee than a general gateway. |
+| D5 | Local embeddings for clustering | Prompts never leave the machine for clustering. A dependency-free embedder is the default; sentence-transformers is optional. |
 
 ---
 
-## 1. Stack & Repo Layout
-
-- Python 3.12, `uv` for env, `ruff` + `mypy --strict`, `pytest`.
-- Hot-path capture store: **SQLite (WAL)** append-only. Analytics store: **DuckDB**, populated by ETL. (See review R2 for why not DuckDB on the hot path.)
-- FastAPI (proxy + backend API), httpx (upstream), React + Vite + Tailwind (dashboard, from M2 per D2).
+## 1. Architecture
 
 ```
-shadowtrace/
-├── proxy/            # passthrough gateway + capture tee (secondary lane)
-│   ├── server.py     # FastAPI app, /v1/messages, /v1/chat/completions
-│   ├── passthrough.py# streaming tee, fail-open logic
-│   ├── capture.py    # async writer → SQLite WAL
-│   └── redact.py     # secret/PII scrub before persistence
-├── ingest/
-│   ├── claude_transcripts.py  # PRIMARY lane: watchdog on ~/.claude/projects/**/*.jsonl
-│   ├── etl.py        # SQLite → DuckDB batch ETL + dedup
-│   ├── claude_export.py  # claude.ai conversations.json importer
-│   └── otel_sink.py  # OTLP receiver for Claude Code telemetry (token metrics)
-├── mining/
-│   ├── embed.py      # local embeddings
-│   ├── cluster.py    # HDBSCAN + label
-│   └── archetypes.py # persistence, rename/merge ops
-├── replay/
-│   ├── sampler.py    # stratified sampling per archetype
-│   ├── ladder.py     # candidate registry (+ price table)
-│   ├── runner.py     # budget-capped executor
-│   ├── graders/      # deterministic checks + judge
-│   └── sprt.py       # sequential test
-├── recommend/
-│   ├── engine.py     # objective-aware recommendations
-│   └── apply/        # actuation writers (claude_code.py, litellm.py, nanoclaw.py)
-├── dashboard/        # streamlit_app.py (v0) → web/ (M4)
-├── cli.py            # `shadow` entrypoint: up, pause, run, report, apply
-├── db/               # schemas + migrations (sqlite_schema.sql, duckdb_schema.sql)
-└── tests/            # mirrors src tree + e2e/ + fixtures/
+ ~/.claude/projects/*.jsonl ──▶ transcript watcher ─┐
+ API clients ──▶ proxy :8787 ──▶ upstream provider  │ (copy, redacted)
+                      └───────────────────────────┐ │
+                                                  ▼ ▼
+                                     SQLite capture store (WAL, append-only)
+                                                  │  sync every 5 min
+                                                  ▼
+                                      DuckDB analytics store
+        ┌──────────────┬─────────────┬────────────┼─────────────┬──────────────┐
+     cluster        replay +       recommend     apply /     monitor + SLOs   dashboard
+   (archetypes)   grade + SPRT                  revert      (drift, quality,   :8788 +
+                                                             performance)     /metrics
 ```
 
-### Core schema (SQLite capture; DuckDB mirrors + derived tables)
+**Storage.** Capture writes go to SQLite in WAL mode, because many small
+concurrent writes on the hot path suit it. Analysis runs on DuckDB, populated
+by an idempotent sync. Keeping them apart means a slow dashboard query can
+never block capture (R2). Both stores live under `~/.shadowtrace/` and carry
+versioned schemas with in-place migrations (`db/migrations.py`).
 
-```sql
-CREATE TABLE traces (
-  id TEXT PRIMARY KEY,            -- ulid
-  ts INTEGER NOT NULL,
-  source TEXT NOT NULL,           -- proxy|otel|claude_export
-  tool TEXT,                      -- claude_code|script|chat|codex
-  model TEXT NOT NULL,
-  request_json BLOB NOT NULL,     -- full message list incl. tool_use blocks (redacted)
-  response_json BLOB NOT NULL,    -- full content blocks (redacted)
-  tokens_in INTEGER, tokens_out INTEGER,
-  latency_ms INTEGER,
-  cost_usd REAL,                  -- NULL for subscription lane
-  session_id TEXT,                -- chain reconstruction
-  parent_id TEXT,                 -- previous call in chain
-  redaction_flags TEXT            -- what was scrubbed / quarantined
-);
--- DuckDB adds: archetype_assignments, replay_results, recommendations, applied_policies
-```
+**Trace rows** keep the full request and response JSON, including system
+prompts and `tool_use`/`tool_result` blocks, not flattened text. Graders and
+chain replay need that structure (R1). Main tables:
 
-Store **full request/response JSON**, not flattened text — Anthropic responses contain `tool_use`/`tool_result` blocks and system prompts that graders and chain-replay need intact (review R1).
+| Table | Holds |
+|---|---|
+| `traces` | Captured calls: model, request/response JSON, tokens, cost (API lane only), session id, redaction flags, quarantine flag |
+| `archetypes`, `archetype_assignments` | Task clusters with stable ids, and trace membership |
+| `replay_results`, `eval_scores` | Candidate answers, verdicts, cost and latency, and one row per scorer |
+| `sprt_verdicts` | Pass, fail or inconclusive per archetype × candidate per run |
+| `recommendations`, `applied_policies` | Recommendations with expiry, and every applied change with the previous file content |
+| `spot_checks`, `human_reviews`, `slo_evaluations` | Online checks, human labels for judge verdicts, and stored SLO evaluations |
+
+**Code layout** mirrors the pipeline: `ingest/`, `proxy/`, `mining/`,
+`replay/` (with `graders/`), `recommend/` (with `apply/`), `monitor/`,
+`dashboard/`, `db/` and `common/`. See the README's project layout.
 
 ---
 
-## 2. Milestones
+## 2. Roadmap
 
-### M0 — Skeleton & guardrails (½ day)
-- Repo scaffold, CI (GitHub Actions: ruff, mypy, pytest, coverage ≥85% gate).
-- `shadow up` starts proxy + collector; `shadow pause` sets capture bypass flag.
-- **Accept:** CI green on empty skeleton; proxy boots and forwards a hardcoded request.
+### M0: Skeleton
 
-### M1 — Capture (transcript ingestion primary + proxy secondary + redaction + ETL)
-Tasks:
-1. **`claude_transcripts.py` (primary lane):** watchdog-based watcher on `~/.claude/projects/**/*.jsonl`; incremental tail-parse (files append during live sessions), map transcript entries → `traces` rows with `session_id` = transcript file, `parent_id` = message ordering, `source=transcript`, `cost_usd=NULL`. Idempotent re-ingest keyed on message uuid. Handle transcript format drift defensively (unknown fields preserved in raw JSON, parser version stamped).
-2. `/v1/messages` (Anthropic) and `/v1/chat/completions` (OpenAI-compat) passthrough proxy with **streaming tee** for the API-key lane: forward SSE chunks unmodified in real time; assemble copy async for capture. Non-streaming path too.
-3. **Fail-open invariants (both lanes):** ingest/capture exception ⇒ user's session unaffected; upstream error ⇒ passed through verbatim; SQLite unavailable ⇒ spill to JSONL, log, continue. Transcript watcher is read-only on Claude Code's files — never locks, never writes there.
-4. Redaction (`redact.py`): regex pack (AWS/GCP keys, JWTs, PEM blocks, common token formats) + entropy scan. Entropy hits are **quarantined** (stored encrypted, flagged, excluded from replay) not deleted — code is high-entropy and false positives would gut coding traces (review R3).
-5. Cost estimation from versioned price table for API lane; quota-weight estimation (tokens vs. published limit heuristics) for subscription lane.
-6. OTel sink for Claude Code telemetry (token metrics, model events) — cross-check against transcript-derived counts.
-7. `claude_export.py`: parse claude.ai conversations.json, idempotent upsert.
-8. ETL job SQLite→DuckDB (cron + on-demand), idempotent.
+| Item | Status | Notes |
+|---|---|---|
+| Repo, CI (ruff, mypy strict, pytest, 85% coverage gate) | Done | `.github/workflows/ci.yml` |
+| `shadow up` / `shadow pause` | Done | `up` also runs sync, the alert loop and the dashboard |
 
-**Accept:** a real Claude Code session (subscription auth, no proxy) appears fully in `shadow report --raw` within 60s of message completion; an API script through the proxy shows zero behavioral diff; kill -9 on any capture component disturbs nothing.
+### M1: Capture
 
-### M2 — Task mining + usage dashboard
-1. Local embedding of prompt texts (extract user-visible text from request JSON; ignore system boilerplate).
-2. HDBSCAN clustering; auto-label clusters via one cheap LLM call over k exemplars (feature-flag: fully-local labeling).
-3. Archetype CRUD: rename/merge/pin; assignments persist across re-clustering (stable via medoid matching).
-4. Dashboard v1 (FastAPI backend + React/Vite/Tailwind per D2): usage over time, model mix, tool split, archetype treemap, trace drill-down. Backend exposes `/api/*` over DuckDB; React app served from same process.
+| Item | Status | Notes |
+|---|---|---|
+| M1.1 Transcript watcher | Done | Polls every 2s, reads incrementally, read-only, skips and counts malformed lines. `shadow ingest` backfills history; `--reset` re-imports after a parser fix |
+| M1.2 Streaming pass-through proxy (Anthropic + OpenAI-compatible) | Done | Byte-identical streaming; capture is assembled asynchronously |
+| M1.3 Fail-open behaviour | Done | Capture errors never reach the user; JSONL spill when SQLite is unavailable |
+| M1.4 Redaction | Partial | Regex pack and entropy quarantine work. Quarantined rows are **not encrypted** yet |
+| M1.5 Cost and quota estimation | Partial | Dollar cost from a price table for the API lane. Quota headroom is a flat tokens ÷ quota-period estimate, not modelled on published limits |
+| M1.6 OTel receiver for Claude Code telemetry | Partial | `ingest/otel_sink.py` exists, but no command starts it, so there's no token-count cross-check |
+| M1.7 claude.ai export importer | Partial | Idempotent importer exists; no CLI command |
+| M1.8 SQLite → DuckDB sync | Done | Periodic in `shadow up`, on demand with `shadow sync` |
 
-**Accept:** ≥80% of a week of real traffic lands in a labeled archetype; merge/rename survives re-cluster.
+### M2: Task mining and dashboard v1
 
-### M3 — Shadow replay
-1. `sampler.py`: stratified by archetype; prioritize volume + recency; exclude quarantined traces.
-2. Candidate ladder config (`ladder.yaml`): Haiku 4.5, Sonnet 4.6, OpenRouter open-weights, **local lane default-on (D3): Ollama for convenience, vLLM server for throughput replay runs** — local candidates cost $0, so the sampler exhausts local candidates before spending replay budget on cloud ones.
-3. `runner.py`: `shadow run --budget 3.00 [--archetype X]` — cost preview, hard cap, resumable checkpoints, concurrency-limited, provider-rate-limit aware.
-4. Graders, cheapest-first:
-   - deterministic: JSON/schema validity, code parses (tree-sitter), diff applies, length/format constraints
-   - pairwise judge: candidate answer vs. **stored frontier answer** (free baseline), rubric per archetype, judge prompt versioned + hash-stamped into results
-5. `sprt.py`: per (archetype, candidate); params α=β=0.05, p0=floor (default 0.90, per-archetype override), p1=floor−0.10. Stop states: pass / fail / budget-exhausted(inconclusive).
-6. Chain replay mode for agentic archetypes: replay top-2 archetypes as sub-chains (re-execute sequence with candidate, carry candidate outputs forward); single-call elsewhere, marked lower-confidence.
+| Item | Status | Notes |
+|---|---|---|
+| M2.1 Embeddings | Done | Hashing embedder by default; sentence-transformers optional and not yet verified in CI |
+| M2.2 Clustering and labels | Partial | HDBSCAN optional (its test runs only when the `ml` extra is installed, which CI doesn't do), built-in fallback otherwise. Labels are keyword-based; the LLM labelling hook isn't wired to any command |
+| M2.3 Archetype rename / merge / pin | Partial | Library functions work and survive re-clustering; no CLI command or API endpoint |
+| M2.4 Dashboard v1 | Partial | Overview, tool split, model mix, archetype list, trace drill-down. Missing: usage over time, archetype treemap |
 
-**Accept:** a $3 budgeted run over seeded fixtures produces SPRT-significant verdicts for ≥3 archetypes; interrupted run resumes without double-spend.
+### M3: Shadow replay
 
-### M4 — Recommender + actuation + regression watch
-1. Objective-aware engine (D1): **primary currency = frontier quota headroom** ("reclaim ~N% of 5-hour/weekly limits"); $/mo shown for API-key lane; local-viability flags per archetype.
-2. Recommendation cards: cheapest passing model, pass-rate CI, latency delta, expiry date (stale after model-market change or 45 days).
-3. Apply writers: Claude Code settings/`CLAUDE.md` model hints; LiteLLM router yaml; NanoClaw-style complexity-router rules. Each writer: dry-run diff → confirm → write → record in `applied_policies`.
-4. Regression watch: online spot-check sampling (grade N/week per applied archetype against floor); breach ⇒ dashboard alert + one-click revert.
-5. Human spot-review queue: 10 samples/archetype where judge decided alone (review R4).
-6. Dashboard v2 (extend React app): recommendation cards, savings/quota tracker, replay leaderboards.
+| Item | Status | Notes |
+|---|---|---|
+| M3.1 Stratified sampler | Done | Per archetype, most recent first, excludes quarantined traces, deterministic per seed |
+| M3.2 Candidate ladder | Done | Ollama, vLLM, Anthropic, OpenRouter; user override at `~/.shadowtrace/ladder.yaml`. Candidates run cheapest-first per sample, not "all local before any cloud" |
+| M3.3 Budget-capped runner | Partial | Hard cap, checkpoints, resume without double-spend, backoff, judge cost counted. Missing: a cost preview before spending |
+| M3.4 Graders | Done | Format, completion, trajectory, grounding (advisory), LLM judge. Code checks use Python's parser, not tree-sitter; diffs are checked for shape, not applied |
+| M3.5 SPRT | Done | α = β = 0.05, p0 = floor (default 0.90), p1 = floor − 0.10 |
+| M3.6 Chain replay | Done | Top-2 archetypes by volume, candidate outputs carried forward, per-chain cap (R6) |
 
-**Accept:** applying a recommendation changes real router config via dry-run→confirm; forced regression fixture triggers alert + revert path.
+### M4: Recommend, apply, watch
+
+| Item | Status | Notes |
+|---|---|---|
+| M4.1 Objective-aware engine | Done | Quota headroom vs dollars per D1.3; latest verdict per pair only; idempotent |
+| M4.2 Recommendation details | Partial | Pass rate with Wilson 95% interval, saving, 45-day expiry. Latency delta is always empty |
+| M4.3 Apply writers | Done | LiteLLM, NanoClaw-style, Claude Code; diff → confirm → write → record; `shadow revert`. None of the target tools reads these mappings natively, so enforcing them needs a hook or wrapper |
+| M4.4 Regression watch | Partial | Revert-on-breach logic and the week-over-week degradation alert exist. Nothing schedules spot-check replays of live traffic, and the dashboard has no revert button |
+| M4.5 Human review queue | Done | `shadow review`: agreement, Cohen's kappa, false-pass rate; feeds an SLO and an alert |
+| M4.6 Dashboard v2 | Partial | Recommendations tab and Health tab (SLOs, alerts, drift, quality, performance, evals). Missing: savings/quota tracker, replay leaderboard view, apply and revert buttons |
+
+### Beyond the original milestones
+
+Built while closing the gaps above:
+
+- Instrumentation helper (`@instrument`), Prometheus `/metrics`,
+  OpenTelemetry GenAI span attributes, process-wide tracer registration.
+- Drift (PSI and JS divergence), data-quality checks and week-over-week
+  performance (`monitor/`).
+- Declarative SLOs and alerts with error budgets and desktop notifications
+  (`monitor/slo.py`, `monitor/slo_rules.yaml`).
+- Replay sends the real conversation, system prompt and tools (inferred from
+  the frontier's calls for transcript traces).
+
+### What's next
+
+In rough priority order:
+
+1. **Scheduled spot-checks** for applied policies, wired to the existing
+   revert-on-breach logic, plus a dashboard revert button (finishes M4.4).
+2. **A smoke test against real providers** (one cheap Haiku call, one Ollama
+   call) to run before releases. Every provider is currently tested only
+   against mocks.
+3. **Encryption at rest** for quarantined rows and the stores (M1.4, §3.5).
+4. **CLI commands for archetype rename/merge/pin and the claude.ai importer**
+   (M2.3, M1.7).
+5. **Start the OTel receiver** in `shadow up` and add a capture-completeness
+   SLO (M1.6, §4.5).
+6. **Cost preview** before `shadow run` spends (M3.3).
+7. **Dashboard:** usage over time, treemap, savings tracker, leaderboard
+   (M2.4, M4.6).
+8. **Smaller items:** latency delta on recommendations (M4.2), LLM cluster
+   labelling (M2.2), per-component log files with rotation (§4.5), a `LICENSE`
+   file.
 
 ---
 
-## 3. Testing Plan
+## 3. Testing
 
-### 3.1 Unit (pytest, per module)
-- `redact`: corpus of true secrets (must scrub) + high-entropy code (must NOT scrub — quarantine only); property tests with hypothesis for format variants.
-- `sprt`: known sequences → exact accept/reject boundaries; simulation test (10k trials) confirming empirical error ≤ α/β.
-- `sampler`: stratification proportions, exclusion rules, determinism under seed.
-- `ladder`: price-table math vs. hand-computed costs.
-- `capture`: writer batching, JSONL spill on induced SQLite failure.
-- `etl`: idempotency (run twice ⇒ identical DuckDB state), dedup on claude.ai re-import.
-- `cluster`: stable archetype ids across re-cluster on fixture corpus.
-- `recommend`: currency selection per access mode; expiry logic.
+Tests never call real providers. Upstreams are a FastAPI fake
+(`tests/fakes/anthropic_server.py`) or `respx` mocks.
+
+### 3.1 Unit
+
+Redaction (true secrets scrubbed, high-entropy code quarantined rather than
+scrubbed, property tests), SPRT (exact boundaries plus 4,000-trial
+simulations of both error rates), sampler, ladder pricing, capture batching and spill,
+sync idempotency, cluster stability, recommender currency and expiry, scorers,
+judge, human review, drift, quality, performance and SLO maths.
 
 ### 3.2 Integration
-- **Transcript watcher suite (primary lane):** fixture `.jsonl` transcripts (incl. tool_use chains) appended incrementally by a writer process — asserts incremental tail-parse correctness, idempotent re-ingest, no file locks held on Claude Code's directory, graceful handling of malformed/unknown-schema lines (skip + flag, never crash).
-- **Fake upstream** (`tests/fakes/anthropic_server.py`): FastAPI stub emitting realistic SSE streams incl. `tool_use` blocks, error statuses, mid-stream disconnects.
-- Proxy suite against fake upstream:
-  - byte-identical passthrough (streaming + non-streaming) — golden transcript diff
-  - client receives full stream even when capture writer is killed mid-stream
-  - upstream 429/500/timeout passed through verbatim; nothing captured as success
-  - tool_use round-trip: multi-block conversation captured with structure intact
-- Replay runner against fake upstream: budget cap enforcement (stops within one call of cap), checkpoint/resume without double-spend, rate-limit backoff.
-- Grader integration: fixture set of (frontier answer, candidate answer, expected verdict) triples per grader; judge tests run against recorded cassettes (respx/vcr) — **no live API in CI**.
 
-### 3.3 End-to-End Testing (comprehensive)
+Proxy against the fake upstream (byte-identical streaming, writer killed
+mid-stream, upstream errors passed through, tool-use structure intact), the
+transcript watcher on files being appended, the replay runner (budget cap,
+resume, backoff), the CLI end to end, and the dashboard API.
 
-**Harness:** `tests/e2e/` runs the full stack via docker-compose (or process-manager fixture): SQLite/DuckDB in a temp `~/.shadowtrace-test/`, fake Anthropic/OpenRouter upstreams, a **synthetic Claude Code session simulator** that appends realistic JSONL transcripts incrementally (streaming-like cadence, tool_use chains, multi-session concurrency) into a temp `~/.claude/projects/` mirror, and a local Ollama stub. Every scenario asserts on final DuckDB state, emitted configs, and **observability signals** (§4.5) — a scenario fails if its expected metrics/log events are absent.
+### 3.3 End-to-end scenarios
 
-**Scenario matrix:**
+Implemented as targeted pytest suites against fakes and real local mechanisms
+(real SQLite locks, real sockets, a real local HTTP server), not a
+docker-compose harness.
 
-| # | Scenario | Asserts |
+| # | Scenario | Status |
 |---|---|---|
-| E1 | Golden path: simulator writes 3 sessions → watcher ingests → ETL → cluster → `shadow run` (local + fake cloud candidates) → recommendation → apply to temp Claude Code settings → tracker updates | Row counts, archetype assignments, SPRT verdicts, config diff matches expected, `capture_lag_seconds` < 60 |
-| E2 | Live-session tail: simulator appends to an open transcript over 5 min | Incremental rows appear without waiting for file close; no partial/corrupt rows |
-| E3 | Malformed transcript lines (truncated JSON, unknown schema version) | Skipped + flagged, ingest continues, `parse_errors_total` incremented, zero crash |
-| E4 | Proxy lane golden path (API script → proxy → fake upstream, streaming + tool_use) | Byte-identical passthrough transcript, captured rows structurally complete |
-| E5 | Failure injection — capture writer killed mid-session; SQLite locked; disk-full on spill dir | Live session unaffected (E2/E4 rerun green), spill JSONL created, recovery ETL backfills, `fail_open_events_total` incremented |
-| E6 | Redaction end-to-end: seeded secrets in simulator prompts | No secret string anywhere in SQLite/DuckDB/logs/exports; quarantine rows flagged + excluded from replay sample |
-| E7 | Replay budget: cap $2.00 with per-call cost fixtures priced to exceed it | Runner stops within one call of cap; checkpoint file valid; resume completes without double-spend; `replay_spend_usd` matches ledger |
-| E8 | SPRT correctness in situ: candidate stubbed at known pass-rates (0.95 / 0.70) | Accept/reject verdicts match expectation; sample counts within theoretical bounds |
-| E9 | Chain replay: agentic archetype replayed as sub-chain with candidate outputs fed forward | Downstream calls use candidate outputs (asserted via fake-upstream request log); per-chain sub-cap honored |
-| E10 | Regression watch: applied policy, then spot-check grades forced below floor | Alert raised, revert restores prior config byte-identically, `applied_policies` history intact |
-| E11 | claude.ai export re-import (same file twice, then extended file) | Idempotent; only-new rows on extended import |
-| E12 | Fresh-install cold start: empty state → `shadow up` → dashboard renders empty-states → first ingest | No crashes on empty DB; onboarding hints shown |
-| E13 | Egress containment: socket-blocking fixture allows only fake-upstream + candidate hosts | Any other outbound attempt fails the run |
-| E14 | Upgrade/migration: run vN schema, apply vN+1 migration on populated DB | Data intact, checksums match, app boots |
+| E1 | Golden path: transcripts → capture → sync → cluster → replay → SPRT → recommend → apply | Done |
+| E2 | Live session tail, incremental, multi-session | Done |
+| E3 | Malformed transcript lines skipped and counted | Done |
+| E4 | Proxy golden path, streaming and tool use | Done |
+| E5 | Failure injection: writer killed, SQLite locked, spill directory unwritable | Done |
+| E6 | No seeded secret appears in any store or log; quarantined rows excluded from replay | Done |
+| E7 | Budget cap, checkpoint, resume without double-spend | Done |
+| E8 | SPRT verdicts match known pass rates | Done |
+| E9 | Chain replay carries candidate outputs forward and respects its sub-cap | Done |
+| E10 | Regression below floor → revert restores config byte for byte | Done (logic); not scheduled, see M4.4 |
+| E11 | claude.ai export re-import is idempotent | Done |
+| E12 | Cold start with an empty database | Done |
+| E13 | Egress containment: only allowed hosts reachable | Done |
+| E14 | Migration on a populated database keeps data intact | Done |
 
-**Cadence & gates:** E1–E6 on every PR; full matrix nightly; full matrix + **live smoke** (real Haiku key, $0.10 cap, real Ollama) before any release tag. A milestone is not "done" until its scenarios pass: M1 → E2–E6, E11, E13; M2 → E1 partial, E12; M3 → E7–E9; M4 → E10, E14.
+Not set up: a nightly full-matrix run, and a live smoke test before releases.
 
 ### 3.4 Performance
-- Proxy overhead budget: **p50 < 5ms, p99 < 15ms** added vs. direct call (locust/k6 against fake upstream, streaming). CI perf job fails on 2× regression.
-- Capture writer sustains 50 req/s burst without backpressure on the live path.
 
-### 3.5 Security/privacy tests
-- Grep-style assertion: no unredacted secret from the test corpus ever appears in SQLite/DuckDB/JSONL/logs after a full e2e run.
-- Quarantined rows excluded from replay sampler and dashboard exports.
-- DB file encryption at rest verified (open without key fails).
+Proxy overhead budget: p50 < 5 ms, p99 < 15 ms (`tests/perf/`, runs in CI).
+The 50 requests/s capture-burst check is not written yet.
+
+### 3.5 Security and privacy
+
+Done: the secret-leak audit (E6), quarantine exclusion and redacted logs. Not
+started: encryption at rest.
 
 ### 3.6 Test data
-- `fixtures/traces/` — 300 synthetic traces across 8 archetypes (generated once, committed), incl. tool-use chains, non-English, long-context, adversarial near-duplicates for cache-like confusions.
-- Fixture generator script documented so the corpus can be regenerated/extended.
+
+304 synthetic traces across 8 archetypes in `tests/fixtures/traces/`. They
+include tool-use chains, non-English, long-context and near-duplicate cases,
+and can be regenerated with `tests/fixtures/generate_traces.py`.
 
 ---
 
-## 4. Non-Functional Requirements
-- Fail-open is the prime invariant: **the app must never break or slow the user's real work**. Any violation is a P0.
-- Single command up/down; state = one directory (`~/.shadowtrace/`), backup = copy it.
-- No network calls except: live forwarding, replay candidates, optional cluster labeling. Enforced by an egress test using a socket-blocking fixture (E13).
+## 4. Non-functional requirements
 
-## 4.5 Observability (the app instruments itself)
+- **Fail open.** shadowtrace must never break or slow the user's own work. Any
+  violation is the highest-priority bug.
+- **One directory of state.** Everything lives under `~/.shadowtrace/`. To back
+  up, copy it; to reset, delete it.
+- **No unexpected network calls.** Outbound traffic goes only to proxied
+  upstreams, configured replay candidates, the judge (if a key is set) and an
+  OTLP endpoint (if set). This is enforced by the E13 test.
 
-OTel-native throughout: every component emits metrics + structured JSON logs + traces to an embedded pipeline (OTLP → local file/SQLite exporter by default; optional OTLP export to the user's own collector/Grafana stack via config — never on by default).
+### 4.5 Observability
 
-### Metrics (Prometheus-convention names)
+shadowtrace instruments itself. Full details are in
+[docs/observability-and-evals.md](docs/observability-and-evals.md).
 
-| Component | Metrics |
+| Area | Status |
 |---|---|
-| Transcript watcher | `capture_lag_seconds` (now − last message ts ingested, gauge), `transcripts_watched`, `messages_ingested_total`, `parse_errors_total`, `unknown_schema_lines_total` |
-| Proxy | `proxy_added_latency_ms` (histogram, p50/p99 — feeds the perf budget), `requests_total{status}`, `fail_open_events_total`, `capture_queue_depth`, `spill_rows_total` |
-| Redaction | `scrubbed_total{pattern}`, `quarantined_total`, `redaction_latency_ms` |
-| ETL | `etl_rows_total`, `etl_lag_seconds`, `dedup_dropped_total`, `etl_failures_total` |
-| Mining | `archetype_count`, `unassigned_traces_ratio`, `embedding_latency_ms` |
-| Replay | `replay_spend_usd` (counter, per key), `replay_calls_total{candidate,archetype}`, `sprt_verdicts_total{state}`, `provider_errors_total{provider,code}`, `checkpoint_age_seconds` |
-| Recommender | `active_policies`, `recommendations_pending`, `regression_alerts_total`, `spot_checks_total{result}` |
-| Self | `db_size_bytes`, `component_up{component}`, build info |
-
-### Tracing
-- Replay pipeline fully traced: `shadow_run` root span → sample → per-call candidate spans (model, tokens, cost attrs) → grader spans → SPRT decision span. One trace answers "why did this run cost $2.40 and stop early on archetype X."
-- Ingest traced per transcript file; proxy traced per request with correlation id also stamped into the captured row (log↔trace↔data joinability).
-
-### Logs
-- Structured JSON, per-component files under `~/.shadowtrace/logs/`, size-based rotation. Redaction runs on log output too (same pack as capture) — logs must never leak what the DB wouldn't.
-
-### Health & alerting (local, no cloud)
-- `/healthz` (liveness) + `/readyz` (DB writable, watcher attached, disk headroom) on the backend.
-- Dashboard "System" tab: component status, capture lag, queue depths, spend gauges, last 50 warnings.
-- Local alert rules → desktop notification + dashboard banner: `capture_lag_seconds > 300`, any `fail_open_events_total` increase, `spill_rows_total > 0`, `etl_lag_seconds > 3600`, replay spend ≥ 80% of budget, regression alert raised, disk < 2GB.
-
-### SLOs (self-imposed, tracked on System tab)
-| SLO | Target |
-|---|---|
-| Capture completeness (transcript-derived token counts vs. OTel-reported, daily cross-check) | ≥ 99% |
-| Capture lag p95 | < 60s |
-| Proxy added latency p99 | < 15ms |
-| ETL freshness | < 1h |
-| Zero unredacted secrets (E6-style audit job, weekly) | 0 findings |
-
-### Observability testing
-- Unit: metric emission per code path (counter increments asserted).
-- E2E: every scenario in §3.3 asserts its expected signals (e.g., E5 must show `fail_open_events_total` +1 and a WARN log with correlation id).
-- Alert-rule tests: synthetic metric injection → notification fires.
-
-### Milestone folding
-Observability is built with each milestone, not after: M0 = OTel pipeline + `/healthz` + logging skeleton; M1 = watcher/proxy/redaction/ETL metrics + capture-lag alert; M2 = mining metrics + System tab in React app; M3 = replay tracing + spend gauges/alerts; M4 = recommender metrics + regression alerting + SLO panel.
+| Metrics (Prometheus naming, `/metrics`) | Done |
+| Tracing (local JSONL, optional OTLP, GenAI attributes; replay, judge, ingest and proxy traced) | Done |
+| Logs: structured JSON, redacted | Partial: written to stderr; per-component files with rotation exist but aren't enabled |
+| `/healthz`, `/readyz` (store, writable state dir, disk headroom) | Done |
+| Alert rules and desktop notifications | Done |
+| SLOs: capture lag, proxy overhead, sync freshness, judge agreement | Done |
+| SLO: capture completeness against Claude Code telemetry | Not started (needs M1.6) |
 
 ---
 
-## 5. Second-Pass Design Review (performed; changes applied above)
+## 5. Risks and mitigations
 
-| # | Finding | Judgment | Resolution |
+| # | Risk | Mitigation | Status |
 |---|---|---|---|
-| R1 | HLD stored `prompt/completion` as text; Anthropic traffic is structured content blocks (tool_use, system). Flattening destroys grader + chain-replay fidelity | Design bug | Schema stores full request/response JSON (§1) |
-| R2 | HLD wrote proxy captures straight to DuckDB. DuckDB is single-writer and weak for concurrent hot-path writes while dashboard reads | Design bug | SQLite WAL on hot path, DuckDB via ETL (§1, M1.7) |
-| R3 | Entropy-based redaction will mass-flag code (hashes, minified JS) — dropping those rows guts the dataset | Real risk | Quarantine-not-delete + encrypted storage (M1.3) |
-| R4 | Judge circularity: pairwise-vs-stored-answer helps but the judge still shares family bias with the baseline | Residual risk | Human spot-review queue (M4.5); optionally cross-family judge as feature flag |
-| R5 | Subscription-auth Claude Code may not honor custom base URL (OAuth-bound) — proxy lane could silently capture nothing for the main tool | **Resolved by D1** | Primary capture switched to local transcript JSONL ingestion (M1.1) — sidesteps auth entirely; proxy retained for API-key lane |
-| R6 | Chain replay cost can explode (candidate output changes downstream calls) | Real risk | Restrict to top-2 archetypes, per-chain budget sub-cap (M3.6) |
-| R7 | Recommendation staleness: model prices/releases shift monthly | Gap in HLD | Expiry dates + re-run triggers (M4.2) |
-| R8 | claude.ai export re-imports would duplicate traces | Minor | Idempotent upsert keyed on export ids (M1.6) |
-| Overall | Architecture sound for single-user scope; fail-open passthrough is the highest-risk component and gets the deepest test coverage accordingly | — | Test plan weights proxy integration tests heaviest (§3.2) |
-
----
-
-## 6. Suggested Claude Code Execution Order
-M0 → M1 (proxy tests before capture features) → dogfood capture for ≥3 days to accumulate real traces → M2 → M3 → M4. Dogfooding gap is intentional: M2 clustering and M3 sampling need real personal traffic, not just fixtures.
+| R1 | Flattening responses to text loses tool calls and system prompts | Store full request/response JSON | Done |
+| R2 | DuckDB is a poor fit for concurrent hot-path writes | SQLite on the hot path, DuckDB via sync | Done |
+| R3 | Entropy-based redaction flags large amounts of code, gutting the dataset | Quarantine instead of delete; exclude from replay | Partial: not encrypted |
+| R4 | The judge shares biases with the frontier baseline | Human review queue with agreement and false-pass alerts; judge model configurable | Done |
+| R5 | Subscription logins may bypass a custom base URL, so the proxy sees nothing | Read Claude Code transcripts directly (D1) | Done |
+| R6 | Chain replay cost can explode as candidate outputs change later calls | Top-2 archetypes only, per-chain spend cap | Done |
+| R7 | Recommendations go stale as prices and models change | 45-day expiry plus a stale-policy alert | Done |
+| R8 | Re-importing a claude.ai export duplicates traces | Idempotent upsert keyed on message id | Done (importer not in CLI yet) |
+| R9 | Claude Code's transcript format is undocumented and may change | Defensive parser, `unknown_model_ratio` data-quality alert, `shadow ingest --reset` to re-import after a fix | Done |
+| R10 | Routing mappings are written but not enforced by the target tools | Documented; enforcement needs a hook or wrapper | Open |
