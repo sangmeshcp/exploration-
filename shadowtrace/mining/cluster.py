@@ -119,6 +119,13 @@ def cluster_embeddings(
     """Returns one cluster label per input vector. -1 = unassigned/noise."""
     if not vectors:
         return []
+    if len(vectors) <= min_cluster_size:
+        # Real HDBSCAN's kd-tree query needs at least min_samples + 1
+        # (= min_cluster_size + 1 by default) training points and raises
+        # ValueError below that — hit in practice when a capture store has
+        # many traces but only a handful with usable prompt text. The
+        # union-find fallback handles arbitrarily small inputs, so use it.
+        return _union_find_cluster(vectors, min_cluster_size, similarity_threshold)
     try:
         return _hdbscan_cluster(vectors, min_cluster_size)
     except ImportError:

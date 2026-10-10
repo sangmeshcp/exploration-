@@ -57,7 +57,13 @@ class SentenceTransformerEmbedder:
         from sentence_transformers import SentenceTransformer
 
         self._model = SentenceTransformer(model_name)
-        self.dims = self._model.get_sentence_embedding_dimension()
+        # renamed from get_sentence_embedding_dimension in newer
+        # sentence-transformers releases; prefer the new name so users on
+        # them don't see a FutureWarning, but keep working on older ones
+        get_dims = getattr(self._model, "get_embedding_dimension", None)
+        if get_dims is None:
+            get_dims = self._model.get_sentence_embedding_dimension
+        self.dims = get_dims()
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         return self._model.encode(texts, convert_to_numpy=True).tolist()  # type: ignore[no-any-return]
