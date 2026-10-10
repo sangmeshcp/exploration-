@@ -21,7 +21,7 @@ when one degrades or your workload shifts.
 ```
 
 > **Status: alpha.** The full pipeline works and has extensive automated tests
-> (235 tests, ~93% coverage). Calls to real model providers have only been
+> (237 tests, ~93% coverage). Calls to real model providers have only been
 > tested against mocked endpoints so far. See [Limitations](#limitations).
 
 ## Contents
@@ -161,6 +161,15 @@ There are two ways traffic gets in. Both write to the same local SQLite store.
   seconds while a session is still running. `shadow ingest` reads your whole
   existing history in one go; it's safe to re-run, because duplicates are
   ignored.
+
+  Because duplicates are skipped, a transcript-parser fix in a newer
+  shadowtrace version won't touch traces you already captured.
+  `shadow ingest --reset` deletes both local stores and re-reads everything
+  from the original transcripts, which Claude Code still has. This also deletes
+  everything derived from them, including archetype names, replay results,
+  recommendations, applied-policy history, human reviews and SLO history, so
+  run `shadow cluster` again afterwards. Your config files and the files
+  `shadow apply` changed are not touched.
 - **Proxy (optional).** `shadow up` starts a pass-through proxy on
   `127.0.0.1:8787` for `/v1/messages` (Anthropic) and `/v1/chat/completions`
   (OpenAI-compatible). Point a tool at it to capture its traffic:
@@ -265,7 +274,7 @@ Run `shadow <command> --help` for every option.
 
 | Command | Does |
 |---|---|
-| `shadow ingest` | Import existing Claude Code transcripts, then sync |
+| `shadow ingest [--reset]` | Import existing Claude Code transcripts, then sync. `--reset` deletes all local data first and re-imports from scratch |
 | `shadow up` | Run everything continuously: transcript watcher, proxy (`:8787`), sync, alert evaluation, dashboard (`:8788`) |
 | `shadow pause` / `resume` | Stop / restart recording without stopping the proxy |
 | `shadow sync` | Copy newly captured traces into the analytics store now |
