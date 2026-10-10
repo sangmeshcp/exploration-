@@ -9,6 +9,7 @@ from pathlib import Path
 from shadowtrace.db import duckdb_store
 from shadowtrace.db import sqlite as sqlite_db
 from shadowtrace.db.migrations import (
+    DUCKDB_CURRENT_VERSION,
     SQLITE_CURRENT_VERSION,
     get_duckdb_version,
     get_sqlite_version,
@@ -95,8 +96,8 @@ def test_duckdb_migration_preserves_data_and_adds_column(tmp_path: Path) -> None
     conn.execute("ALTER TABLE traces DROP COLUMN notes")
 
     new_version = migrate_duckdb(conn)
-    assert new_version == 2
-    assert get_duckdb_version(conn) == 2
+    assert new_version == DUCKDB_CURRENT_VERSION
+    assert get_duckdb_version(conn) == DUCKDB_CURRENT_VERSION
 
     cols = {row[1] for row in conn.execute("PRAGMA table_info('traces')").fetchall()}
     assert "notes" in cols
@@ -114,4 +115,18 @@ def test_duckdb_migration_is_idempotent(tmp_path: Path) -> None:
 
     migrate_duckdb(conn)
     migrate_duckdb(conn)
-    assert get_duckdb_version(conn) == 2
+    assert get_duckdb_version(conn) == DUCKDB_CURRENT_VERSION
+
+
+def test_duckdb_v3_adds_replay_response_text_and_keeps_rows(tmp_path: Path) -> None:
+    conn = duckdb_store.connect(tmp_path / "a.duckdb")
+    conn.execute(
+        "INSERT INTO replay_results (id, archetype_id, candidate, source_trace_id, verdict, "
+        "cost_usd, grader, run_id, ts) VALUES ('r1', 'a1', 'c', 't1', 'pass', 0.0, 'g', 'run', 1)"
+    )
+    conn.execute("UPDATE schema_meta SET version = 2")
+    conn.execute("ALTER TABLE replay_results DROP COLUMN response_text")
+
+    assert migrate_duckdb(conn) == DUCKDB_CURRENT_VERSION
+    row = conn.execute("SELECT id, verdict, response_text FROM replay_results").fetchone()
+    assert row == ("r1", "pass", None)

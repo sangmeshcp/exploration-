@@ -1,0 +1,160 @@
+# Default SLOs and alert rules (plan.md §4.5). Copy this file to
+# ~/.shadowtrace/slo_rules.yaml to change thresholds or add rules; a user
+# file replaces this one entirely.
+#
+# Each objective compares one SLI (see `shadow slo --list-slis`) against a
+# threshold:
+#   kind: slo    tracked over time; `target` is the share of evaluations in
+#                the `window_days` window that must meet the threshold, and
+#                the error budget is what's left of (1 - target)
+#   kind: alert  fires while the comparison fails, no budget
+#   op: the condition that means HEALTHY (<=, <, >=, >, ==)
+#   severity: info | warning | critical (critical also sends a desktop
+#             notification when notifications are on)
+
+objectives:
+  # --- SLOs --------------------------------------------------------------
+  - name: capture_lag
+    kind: slo
+    sli: capture_lag_seconds
+    op: "<="
+    threshold: 60
+    target: 0.95
+    window_days: 28
+    severity: warning
+    description: Live transcript messages land in the capture store within 60s
+
+  - name: proxy_overhead
+    kind: slo
+    sli: proxy_added_latency_p99_ms
+    op: "<="
+    threshold: 15
+    target: 0.99
+    window_days: 28
+    severity: warning
+    description: The proxy adds under 15ms p99 to API-key-lane calls
+
+  - name: etl_freshness
+    kind: slo
+    sli: etl_lag_seconds
+    op: "<="
+    threshold: 3600
+    target: 0.99
+    window_days: 28
+    severity: warning
+    description: The analytics store is never more than an hour behind capture
+
+  - name: judge_trustworthiness
+    kind: slo
+    sli: judge_human_agreement
+    op: ">="
+    threshold: 0.85
+    target: 0.90
+    window_days: 28
+    severity: warning
+    description: The replay judge agrees with human reviewers at least 85% of the time
+
+  # --- Alerts ------------------------------------------------------------
+  - name: fail_open_triggered
+    kind: alert
+    sli: fail_open_events_total
+    op: "=="
+    threshold: 0
+    severity: critical
+    description: A capture component failed and fell back to pass-through
+
+  - name: spill_in_use
+    kind: alert
+    sli: spill_rows_total
+    op: "=="
+    threshold: 0
+    severity: warning
+    description: Rows are spilling to JSONL because SQLite was unavailable
+
+  - name: pipeline_errors
+    kind: alert
+    sli: operation_error_ratio
+    op: "<="
+    threshold: 0.05
+    severity: warning
+    description: More than 5% of instrumented pipeline operations are failing
+
+  - name: low_disk
+    kind: alert
+    sli: disk_free_gb
+    op: ">="
+    threshold: 2
+    severity: critical
+    description: Less than 2GB free where ~/.shadowtrace lives
+
+  - name: model_degraded
+    kind: alert
+    sli: degraded_candidate_pairs
+    op: "=="
+    threshold: 0
+    severity: critical
+    description: A candidate's pass rate on an archetype dropped significantly week over week
+
+  - name: policy_reverted
+    kind: alert
+    sli: policies_reverted_7d
+    op: "=="
+    threshold: 0
+    severity: warning
+    description: The regression watch reverted an applied routing policy this week
+
+  - name: judge_unreliable
+    kind: alert
+    sli: judge_false_pass_rate
+    op: "<="
+    threshold: 0.10
+    severity: critical
+    description: Over 10% of the judge's PASS verdicts were overturned by human review
+
+  - name: judge_errors
+    kind: alert
+    sli: judge_errors_total
+    op: "=="
+    threshold: 0
+    severity: warning
+    description: Judge calls are failing (candidates are being failed closed)
+
+  - name: archetype_drift
+    kind: alert
+    sli: archetype_mix_psi
+    op: "<="
+    threshold: 0.25
+    severity: warning
+    description: The task mix shifted significantly; recommendations may not fit current traffic
+
+  - name: prompt_length_drift
+    kind: alert
+    sli: prompt_length_psi
+    op: "<="
+    threshold: 0.25
+    severity: info
+    description: Prompt sizes shifted significantly versus the 28-day baseline
+
+  - name: archetype_coverage
+    kind: alert
+    sli: unassigned_traces_ratio
+    op: "<="
+    threshold: 0.20
+    severity: warning
+    description: Over 20% of replayable traffic is outside every archetype (run `shadow cluster`)
+
+  - name: token_counts_missing
+    kind: alert
+    sli: missing_token_counts_ratio
+    op: "<="
+    threshold: 0.05
+    severity: warning
+    description: Many traces lack token counts, so quota headroom is under-reported
+
+  - name: stale_policies
+    kind: alert
+    sli: expired_applied_policies
+    op: "=="
+    threshold: 0
+    severity: info
+    description: An applied policy's recommendation expired (45 days); re-run `shadow run`

@@ -133,6 +133,41 @@ def test_apply_dry_run_then_confirmed(_env: Path) -> None:
     assert data["model_routing"]["Code"] == "claude-haiku-4-5"
 
 
+def test_revert_restores_file_byte_for_byte(_env: Path) -> None:
+    conn = duckdb_store.connect(_env / "analytics.duckdb")
+    now = 1_700_000_000_000
+    conn.execute(
+        "INSERT INTO archetypes (id, label, pinned, created_ts, updated_ts) "
+        "VALUES ('a1', 'Code', False, ?, ?)",
+        [now, now],
+    )
+    conn.execute(
+        "INSERT INTO recommendations (id, archetype_id, candidate, currency, value, pass_rate, "
+        "pass_rate_ci_low, pass_rate_ci_high, latency_delta_ms, created_ts, expires_ts) "
+        "VALUES ('rec1', 'a1', 'claude-haiku-5-5', 'usd_per_month', 1.0, 0.95, 0.9, 0.98, NULL, ?, ?)",
+        [now, now + 1_000_000],
+    )
+    conn.close()
+    output_path = _env / "router.yaml"
+    original = "# hand-written\nmodel_list: []\n"
+    output_path.write_text(original)
+
+    runner = CliRunner()
+    applied = runner.invoke(
+        main, ["apply", "rec1", "--writer", "litellm", "--output-path", str(output_path), "--yes"]
+    )
+    assert applied.exit_code == 0, applied.output
+    policy_id = applied.output.strip().split()[-1]
+    assert output_path.read_text() != original
+
+    reverted = runner.invoke(main, ["revert", policy_id, "--output-path", str(output_path)])
+    assert reverted.exit_code == 0, reverted.output
+    assert output_path.read_text() == original
+
+    again = runner.invoke(main, ["revert", policy_id, "--output-path", str(output_path)])
+    assert again.exit_code != 0
+
+
 def test_apply_unknown_recommendation_errors(_env: Path) -> None:
     duckdb_store.connect(_env / "analytics.duckdb").close()
     runner = CliRunner()

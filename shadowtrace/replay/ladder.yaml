@@ -1,18 +1,33 @@
 # Candidate ladder (plan.md M3.2). Local candidates (Ollama/vLLM, D3) are
 # listed first and cost $0 — sampler/runner exhaust these before spending
 # replay budget on metered cloud candidates.
+#
+# `name` is shadowtrace's label for a candidate (what recommendations and
+# router configs refer to); `model` is the id the provider's API expects,
+# and defaults to `name` when omitted. Endpoints for the self-hosted and
+# third-party providers come from env vars: SHADOWTRACE_OLLAMA_URL
+# (default http://localhost:11434), SHADOWTRACE_VLLM_URL (default
+# http://localhost:8000), and OPENROUTER_API_KEY.
 candidates:
   - name: ollama-llama3.1-8b
     provider: ollama
+    model: llama3.1:8b
     local: true
     price_per_mtok_in: 0.0
     price_per_mtok_out: 0.0
 
   - name: vllm-qwen2.5-14b
     provider: vllm
+    model: Qwen/Qwen2.5-14B-Instruct
     local: true
     price_per_mtok_in: 0.0
     price_per_mtok_out: 0.0
+
+  - name: claude-haiku-5-5
+    provider: anthropic
+    local: false
+    price_per_mtok_in: 0.1
+    price_per_mtok_out: 0.5
 
   - name: claude-haiku-4-5
     provider: anthropic
@@ -28,6 +43,7 @@ candidates:
 
   - name: openrouter-llama3.1-70b
     provider: openrouter
+    model: meta-llama/llama-3.1-70b-instruct
     local: false
     price_per_mtok_in: 0.4
     price_per_mtok_out: 0.4

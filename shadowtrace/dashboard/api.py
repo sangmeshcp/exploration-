@@ -1,22 +1,33 @@
 """Dashboard backend: FastAPI over DuckDB (plan.md M2.4/M4.6, D2).
 
-Serves `/api/*` for the React app (dashboard/web/) plus `/healthz` /
-`/readyz` for the System tab and local alerting (§4.5). Read-only over
-the analytics store — all writes happen through the CLI / mining /
-replay / recommend modules, never through this API.
+Serves `/api/*` for the React app (dashboard/web/), `/healthz` /
+`/readyz` for liveness and readiness, and `/metrics` in Prometheus text
+format so any scraper (Prometheus, Grafana Agent, Datadog, the OTel
+collector) can pick up shadowtrace's metrics. Read-only over the analytics
+store — all writes happen through the CLI / mining / replay / recommend
+modules, never through this API.
 """
 
 from __future__ import annotations
 
+import os
+import shutil
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from shadowtrace.common.config import Settings, get_settings
 from shadowtrace.common.metrics import REGISTRY
 from shadowtrace.db import duckdb_store
+from shadowtrace.monitor import drift, performance, quality, slo
+from shadowtrace.replay import store as replay_store
+from shadowtrace.replay.graders import human_review
+
+MIN_FREE_DISK_GB = 2.0
 
 
 def _connect(settings: Settings) -> Any:
@@ -34,8 +45,57 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/readyz")
     async def readyz() -> dict[str, Any]:
-        ready = settings.duckdb_path.exists()
-        return {"ready": ready, "duckdb_path": str(settings.duckdb_path)}
+        checks = {
+            "analytics_store": settings.duckdb_path.exists(),
+            "state_dir_writable": settings.home.exists() and os.access(settings.home, os.W_OK),
+            "disk_headroom": settings.home.exists()
+            and shutil.disk_usage(settings.home).free / 1e9 >= MIN_FREE_DISK_GB,
+        }
+        return {
+            "ready": all(checks.values()),
+            "checks": checks,
+            "duckdb_path": str(settings.duckdb_path),
+        }
+
+    @app.get("/metrics", response_class=PlainTextResponse)
+    async def metrics() -> str:
+        return REGISTRY.to_prometheus()
+
+    @app.get("/api/slo")
+    async def slo_status() -> dict[str, Any]:
+        conn = _connect(settings)
+        objectives = slo.load_objectives(settings.slo_rules_path)
+        ctx = slo.SLIContext(conn=conn, home=settings.home, sqlite_path=settings.sqlite_path)
+        evaluations = slo.evaluate(objectives, ctx)
+        by_name = {o.name: o for o in objectives}
+        compliance = {
+            ev.name: asdict(slo.compliance(conn, by_name[ev.name]))
+            for ev in evaluations
+            if ev.kind == "slo"
+        }
+        return {
+            "evaluations": [ev.to_dict() for ev in evaluations],
+            "firing": [ev.to_dict() for ev in evaluations if ev.status == "breach"],
+            "compliance": compliance,
+        }
+
+    @app.get("/api/monitor")
+    async def monitor() -> dict[str, Any]:
+        conn = _connect(settings)
+        return {
+            "drift": [asdict(r) for r in drift.drift_report(conn)],
+            "quality": [asdict(c) for c in quality.data_quality(conn)],
+            "performance": [asdict(p) for p in performance.performance_report(conn)],
+        }
+
+    @app.get("/api/evals")
+    async def evals() -> dict[str, Any]:
+        conn = _connect(settings)
+        return {
+            "scorers": replay_store.scorer_summary(conn),
+            "judge_agreement": asdict(human_review.agreement(conn)),
+            "pending_reviews": len(human_review.pending(conn, limit=10_000)),
+        }
 
     @app.get("/api/summary")
     async def summary() -> dict[str, Any]:
