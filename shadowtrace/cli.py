@@ -39,7 +39,7 @@ from shadowtrace.monitor import drift, performance, quality, slo
 from shadowtrace.proxy.capture import CaptureWriter
 from shadowtrace.proxy.server import ProxyConfig, create_app
 from shadowtrace.recommend import engine as recommend_engine
-from shadowtrace.recommend.apply import apply_recommendation
+from shadowtrace.recommend.apply import apply_recommendation, revert_policy
 from shadowtrace.recommend.apply.claude_code import ClaudeCodeWriter
 from shadowtrace.recommend.apply.litellm import LiteLLMWriter
 from shadowtrace.recommend.apply.nanoclaw import NanoClawWriter
@@ -288,8 +288,10 @@ def cluster() -> None:
 
 
 @main.command(name="run")
-@click.option("--budget", "budget_usd", type=float, required=True)
-@click.option("--archetype", "archetype_id", default=None)
+@click.option(
+    "--budget", "budget_usd", type=float, required=True, help="hard spend cap for the run, in USD"
+)
+@click.option("--archetype", "archetype_id", default=None, help="replay only this archetype id")
 @click.option("--n-per-archetype", default=10, show_default=True)
 @click.option("--seed", default=0, show_default=True)
 @click.option("--floor", default=0.90, show_default=True, help="per-archetype SPRT pass-rate floor")
@@ -297,7 +299,7 @@ def cluster() -> None:
     "--chains/--no-chains",
     default=True,
     show_default=True,
-    help="also chain-replay the top-2 archetypes by volume (plan.md M3.6)",
+    help="also replay whole sessions (multi-turn chains) for the 2 busiest archetypes",
 )
 @click.option(
     "--chain-budget",
@@ -305,7 +307,7 @@ def cluster() -> None:
     type=float,
     default=0.50,
     show_default=True,
-    help="per-chain budget sub-cap, independent of --budget (review R6)",
+    help="spend cap per replayed chain, in USD, separate from --budget",
 )
 def run_cmd(
     budget_usd: float,
@@ -454,6 +456,29 @@ def apply_cmd(recommendation_id: str, writer: str, output_path: Path, yes: bool)
     )
     assert not isinstance(result, str)
     click.echo(f"applied as policy {result.id}")
+
+
+@main.command()
+@click.argument("policy_id")
+@click.option(
+    "--output-path",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="the file the policy was applied to",
+)
+@click.option("--reason", default="manual revert", show_default=True)
+def revert(policy_id: str, output_path: Path, reason: str) -> None:
+    """Restore a config file to exactly what it was before `shadow apply`."""
+    settings = get_settings()
+    conn = duckdb_store.connect(settings.duckdb_path)
+    row = conn.execute(
+        "SELECT writer FROM applied_policies WHERE id = ? AND reverted_ts IS NULL", [policy_id]
+    ).fetchone()
+    if row is None:
+        raise click.ClickException(f"no active applied policy with id={policy_id!r}")
+    writer = _WRITERS[row[0]](output_path)
+    revert_policy(conn, {row[0]: writer}, policy_id, reason=reason)
+    click.echo(f"reverted policy {policy_id}; {output_path} restored")
 
 
 @main.command()

@@ -1,23 +1,15 @@
 # Observability, evaluation and monitoring
 
-shadowtrace already captured LLM traffic, replayed it against cheaper models
-and recommended routing changes. This layer makes three things first-class:
-**instrumentation** (every stage reports the same metrics, logs and traces),
-**evaluation** (composable scorers, an LLM judge, and human review that
-checks the judge) and **monitoring** (drift, data quality, performance over
-time, SLOs, alerts and error budgets).
+This guide covers how shadowtrace instruments itself, how replay answers are
+graded, and how drift, data quality, SLOs and alerts work, including how to
+extend each one.
 
-It was shaped by a typical ML/GenAI observability platform remit. The table
-maps each of those responsibilities to what exists here.
-
-| Platform responsibility | In shadowtrace |
-|---|---|
-| Metrics, logs and distributed traces across inference, batch scoring, pipelines and agent orchestration, instrumented consistently | `common/instrument.py`: one decorator/context manager emits a span, `operation_duration_ms`, `operations_total{status}` and an error log with the trace id. Model-call spans carry OpenTelemetry GenAI attributes (`gen_ai.*`). |
-| Primitives to monitor model performance, data quality, drift and degradation | `monitor/performance.py` (week-over-week pass rate per archetype × candidate, two-proportion z-test), `monitor/quality.py` (six data-quality checks), `monitor/drift.py` (PSI and Jensen–Shannon divergence on task mix, model mix and prompt length) |
-| Evaluation frameworks for LLM and agentic systems: response quality, grounding/hallucination, task success, tool-use and trajectory correctness, LLM-as-judge, human-in-the-loop | `replay/graders/scorers.py` (format, completion, trajectory, grounding, judge scorers plus a composable `EvalSuite`), `llm_judge.py` (Claude judge via the Anthropic SDK, cost counted in the replay budget), `human_review.py` (review queue, agreement, Cohen's kappa, false-pass rate) |
-| Build-vs-buy; SDKs, connectors and APIs to vendor platforms | Vendor-neutral interfaces rather than a vendor SDK: OTLP span export (`SHADOWTRACE_OTLP_ENDPOINT`), Prometheus `/metrics`, GenAI semantic conventions. See [Build vs buy](#build-vs-buy). |
-| Reusable libraries and templates for observability-by-default | `@instrument(...)`, the `Scorer` interface, `register_sli(...)`, and `monitor/slo_rules.yaml` as a copy-and-edit template |
-| Dashboarding, alerting and SLO/SLI building blocks with templates for performance, latency and cost | SLI registry + declarative objectives + stored evaluations → attainment and error budgets (`monitor/slo.py`); transition-based alerting with optional desktop notifications; the dashboard's **Health** tab; `/api/slo`, `/api/monitor`, `/api/evals` |
+| Area | Code | Extension point |
+|---|---|---|
+| Instrumentation | `common/instrument.py`, `common/metrics.py`, `common/tracing.py` | `@instrument("op", component="x")` |
+| Evaluation | `replay/graders/scorers.py`, `llm_judge.py`, `human_review.py` | any `async (EvalCase) -> Score \| None` function |
+| Monitoring | `monitor/drift.py`, `quality.py`, `performance.py` | — |
+| SLOs and alerts | `monitor/slo.py`, `monitor/slo_rules.yaml` | `@register_sli("name")` and your own `slo_rules.yaml` |
 
 ## Instrumentation
 
