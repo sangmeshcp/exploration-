@@ -47,6 +47,25 @@ def test_cluster_embeddings_empty_input() -> None:
     assert cluster_embeddings([]) == []
 
 
+def test_cluster_embeddings_fewer_vectors_than_min_cluster_size_does_not_crash() -> None:
+    """Regression test: with the real hdbscan backend installed, handing
+    cluster_embeddings fewer vectors than min_cluster_size crashed on some
+    hdbscan releases with "ValueError: k must be less than or equal to the
+    number of training points" (its kd-tree query needs min_samples + 1
+    points; newer releases clamp, older ones raise). Hit in practice on a
+    store with 342 traces but only 3 usable prompts. Tiny inputs must
+    route to the size-tolerant fallback instead — which is also strictly
+    better semantically: at n <= min_cluster_size real HDBSCAN could only
+    ever return all-noise, while the fallback can still form one cluster."""
+    vectors = HashingEmbedder(dims=64).embed(["one prompt", "two prompt", "three prompt"])
+    labels = cluster_embeddings(vectors, min_cluster_size=3)
+    assert len(labels) == 3
+    assert all(isinstance(lbl, int) for lbl in labels)
+
+    # a single vector is the degenerate extreme of the same path
+    assert cluster_embeddings(vectors[:1], min_cluster_size=3) == [-1]
+
+
 def test_keyword_label_picks_significant_words() -> None:
     label = keyword_label(CODE_QUESTIONS)
     assert "Loop" in label or "Python" in label
